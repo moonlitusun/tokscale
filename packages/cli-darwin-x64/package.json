@@ -1,7 +1,7 @@
 {
-  "name": "@tokscale/cli-darwin-x64",
+  "name": "tokenusage-cli-darwin-x64",
   "version": "4.5.3",
-  "description": "tokscale CLI binary for darwin x64",
+  "description": "tokenusage CLI binary for darwin x64",
   "license": "MIT",
   "type": "module",
   "os": [
@@ -10,17 +10,17 @@
   "cpu": [
     "x64"
   ],
-  "main": "bin/tokscale",
+  "main": "bin/tu",
   "files": [
     "bin"
   ],
   "publishConfig": {
-    "registry": "https://registry.npmjs.org/",
+    "registry": "http://npm.dzfe.net/",
     "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/junhoyeo/tokscale.git",
+    "url": "git+https://github.com/junhoyeo/tokenusage.git",
     "directory": "packages/cli-darwin-x64"
   }
 }

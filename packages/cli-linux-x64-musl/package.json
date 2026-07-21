@@ -1,7 +1,7 @@
 {
-  "name": "@tokscale/cli-linux-x64-musl",
+  "name": "tokenusage-cli-linux-x64-musl",
   "version": "4.5.3",
-  "description": "tokscale CLI binary for linux x64 musl",
+  "description": "tokenusage CLI binary for linux x64 musl",
   "license": "MIT",
   "type": "module",
   "os": [
@@ -13,17 +13,17 @@
   "libc": [
     "musl"
   ],
-  "main": "bin/tokscale",
+  "main": "bin/tu",
   "files": [
     "bin"
   ],
   "publishConfig": {
-    "registry": "https://registry.npmjs.org/",
+    "registry": "http://npm.dzfe.net/",
     "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/junhoyeo/tokscale.git",
+    "url": "git+https://github.com/junhoyeo/tokenusage.git",
     "directory": "packages/cli-linux-x64-musl"
   }
 }

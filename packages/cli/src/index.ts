@@ -4,13 +4,13 @@ import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { resolve, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const binaryName = process.platform === "win32" ? "tokscale.exe" : "tokscale";
+const binaryName = process.platform === "win32" ? "tu.exe" : "tu";
 
 const currentDir = fileURLToPath(new URL(".", import.meta.url));
 const dirName = basename(currentDir);
-// In npm install: currentDir = .../node_modules/@tokscale/cli/dist/
-//   cliDir = .../node_modules/@tokscale/cli/
-//   scopeDir = .../node_modules/@tokscale/
+// In npm install: currentDir = .../node_modules/tokenusage-cli/dist/
+//   cliDir = .../node_modules/tokenusage-cli/
+//   scopeDir = .../node_modules/tokenusage-
 // In monorepo dev (dist): currentDir = .../packages/cli/dist/
 //   cliDir = .../packages/cli/
 //   scopeDir = .../packages/
@@ -105,25 +105,25 @@ function resolveTargetPackageName(): string | null {
   const arch = process.arch;
 
   if (process.platform === "darwin") {
-    if (arch === "arm64") return "cli-darwin-arm64";
-    if (arch === "x64") return "cli-darwin-x64";
+    if (arch === "arm64") return "tokenusage-cli-darwin-arm64";
+    if (arch === "x64") return "tokenusage-cli-darwin-x64";
     return null;
   }
 
   if (process.platform === "linux") {
     const libc = detectLibcKind();
     if (arch === "arm64") {
-      return libc === "musl" ? "cli-linux-arm64-musl" : "cli-linux-arm64-gnu";
+      return libc === "musl" ? "tokenusage-cli-linux-arm64-musl" : "tokenusage-cli-linux-arm64-gnu";
     }
     if (arch === "x64") {
-      return libc === "musl" ? "cli-linux-x64-musl" : "cli-linux-x64-gnu";
+      return libc === "musl" ? "tokenusage-cli-linux-x64-musl" : "tokenusage-cli-linux-x64-gnu";
     }
     return null;
   }
 
   if (process.platform === "win32") {
-    if (arch === "arm64") return "cli-win32-arm64-msvc";
-    if (arch === "x64") return "cli-win32-x64-msvc";
+    if (arch === "arm64") return "tokenusage-cli-win32-arm64-msvc";
+    if (arch === "x64") return "tokenusage-cli-win32-x64-msvc";
     return null;
   }
 
@@ -168,11 +168,11 @@ const searchPaths: string[] = [];
 
 if (targetPackage) {
   searchPaths.push(
-    // npm/bun install: sibling scoped package (node_modules/@tokscale/cli-<platform>/bin/...)
+    // npm/bun install: sibling scoped package (node_modules/tokenusage-cli-<platform>/bin/...)
     join(scopeDir, targetPackage, "bin", binaryName),
-    // Nested node_modules: non-hoisted / pnpm (node_modules/@tokscale/cli/node_modules/@tokscale/cli-<platform>/bin/...)
+    // Nested node_modules: non-hoisted / pnpm (node_modules/tokenusage-cli/node_modules/tokenusage-cli-<platform>/bin/...)
     join(cliDir, "node_modules", "@tokscale", targetPackage, "bin", binaryName),
-    // Hoisted edge case (node_modules/@tokscale/node_modules/@tokscale/cli-<platform>/bin/...)
+    // Hoisted edge case (node_modules/tokenusage-node_modules/tokenusage-cli-<platform>/bin/...)
     join(scopeDir, "node_modules", "@tokscale", targetPackage, "bin", binaryName),
     join(workspaceRoot, "node_modules", "@tokscale", targetPackage, "bin", binaryName),
     // Monorepo development
@@ -216,10 +216,10 @@ function isSelfReference(p: string): boolean {
 let binary = searchPaths.find((p) => existsSync(p) && !isSelfReference(p));
 
 if (!binary) {
-  console.error("Error: tokscale binary not found");
+  console.error("Error: tu binary not found");
   console.error("Build from source: cargo build --release -p tokscale-cli");
   if (targetPackage) {
-    console.error(`Expected optional package: @tokscale/${targetPackage}`);
+    console.error(`Expected optional package: tokenusage-${targetPackage}`);
   }
   process.exit(1);
 }

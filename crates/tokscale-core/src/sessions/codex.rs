@@ -244,6 +244,10 @@ pub(crate) struct CodexParseState {
     /// it across incremental re-parses.
     #[serde(default)]
     pub forked_child_is_user_fork: bool,
+    #[serde(default)]
+    pub previous_last_totals: Option<CodexTotals>,
+    #[serde(default)]
+    pub current_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -467,6 +471,8 @@ fn parse_codex_reader<R: BufRead>(
                     let turn_start_ms = parse_codex_entry_timestamp(entry.timestamp.as_deref());
                     state.current_turn_start_ms = turn_start_ms;
                     state.last_accepted_token_timestamp_ms = turn_start_ms;
+                    state.previous_last_totals = None;
+                    state.current_turn_id = payload.turn_id.clone();
                     if let Some(model) = state.current_model.clone() {
                         flush_pending_model_messages(
                             &mut pending_model_messages,
@@ -503,6 +509,8 @@ fn parse_codex_reader<R: BufRead>(
                         // token time and bridge backward across the idle gap.
                         state.last_accepted_token_timestamp_ms =
                             parse_codex_entry_timestamp(entry.timestamp.as_deref());
+                        state.previous_last_totals = None;
+                        state.current_turn_id = None;
                     }
                     handled = true;
                 }
@@ -532,7 +540,37 @@ fn parse_codex_reader<R: BufRead>(
                     // capping can rewrite them), so we only use total_token_usage for
                     // dedup and monotonicity checks — never as a direct delta source.
                     let total_usage = info.total_token_usage.as_ref().map(CodexTotals::from_usage);
-                    let last_usage = info.last_token_usage.as_ref().map(CodexTotals::from_usage);
+
+                    let turn_id = payload.turn_id.as_deref().unwrap_or("no-turn-id").to_string();
+                    let is_new_turn = state.current_turn_id.as_ref() != Some(&turn_id);
+                    if is_new_turn {
+                        state.current_turn_id = Some(turn_id);
+                        state.previous_last_totals = None;
+                    }
+
+                    // Check if total grew while last did not, indicating a new turn session
+                    if let (Some(total), Some(previous)) = (total_usage, state.previous_totals) {
+                        let last_val = info.last_token_usage.as_ref().map(CodexTotals::from_usage).unwrap_or_default();
+                        let prev_last_val = state.previous_last_totals.unwrap_or_default();
+                        let total_diff = total.input - previous.input;
+                        let last_diff = last_val.input - prev_last_val.input;
+                        if total_diff > 0 && last_diff < total_diff {
+                            state.previous_last_totals = None;
+                        }
+                    }
+
+                    let last_usage_raw = info.last_token_usage.as_ref().map(CodexTotals::from_usage);
+                    let last_usage = if let Some(last) = last_usage_raw {
+                        let delta = if let Some(prev) = state.previous_last_totals {
+                            last.delta_from(prev).unwrap_or(last)
+                        } else {
+                            last
+                        };
+                        state.previous_last_totals = Some(last);
+                        Some(delta)
+                    } else {
+                        None
+                    };
 
                     // Forked child logs can replay more than one parent
                     // token_count row after the first child turn_context,
@@ -650,10 +688,14 @@ fn parse_codex_reader<R: BufRead>(
                         // per sibling. Scope the key to the fork parent instead
                         // so sibling replays share one key. Unrelated sessions
                         // keep their own id and never merge.
+                        // After the replay gate, subagent events are unique to this file.
+                        // Use the child's own session ID so siblings don't collide.
+                        // Only the replayed parent history (already skipped by the
+                        // forked_child_waiting_for_turn_context gate above) needs the
+                        // parent scope to dedup across files.
                         let dedup_scope_id = state
-                            .session_forked_from_id
+                            .session_id_from_meta
                             .as_deref()
-                            .or(state.session_id_from_meta.as_deref())
                             .unwrap_or(session_id);
                         set_codex_dedup_key(
                             &mut message,
@@ -2908,5 +2950,90 @@ mod tests {
             messages[1].is_turn_start,
             "the deferred turn-start marker must still apply"
         );
+    }
+
+    #[test]
+    fn test_subagent_files_dedup_and_delta() {
+        // Parent ID: 019f5976-f447-7b70-ae8c-016344ed5588
+        // Parent turn: 019f5976-f447-7b70-ae8c-016344ed5589
+        // Subagent A ID: 019f7dba-d008-77e2-88dc-43e6d17b417d
+        // Subagent A turn: 019f7dbb-d008-77e2-88dc-43e6d17b417d (greater timestamp)
+        // Subagent B ID: 019f7daa-3ffd-71d1-8ced-671d3035ae0a
+        // Subagent B turn: 019f7dab-3ffd-71d1-8ced-671d3035ae0a (greater timestamp)
+
+        // Subagent A log:
+        // 1. Child meta setting child ID and parent ID (physically first line in subagent logs)
+        // 2. Replay parent meta
+        // 3. Replay parent turn context and parent token count
+        // 4. Child turn context (ends replay gate)
+        // 5. Child token count (starts at 10 and updates to 15 within same turn)
+        let lines_a = vec![
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"019f7dba-d008-77e2-88dc-43e6d17b417d","forked_from_id":"019f5976-f447-7b70-ae8c-016344ed5588"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"019f5976-f447-7b70-ae8c-016344ed5588"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.2","turn_id":"019f5976-f447-7b70-ae8c-016344ed5589"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":20},"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":20}}}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-5.2","turn_id":"019f7dbb-d008-77e2-88dc-43e6d17b417d"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110,"cached_input_tokens":0,"output_tokens":25},"last_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":115,"cached_input_tokens":0,"output_tokens":25},"last_token_usage":{"input_tokens":15,"cached_input_tokens":0,"output_tokens":5}}}}"#,
+        ].join("\n");
+
+        // Subagent B log:
+        // 1. Child B meta
+        // 2. Replay parent meta
+        // 3. Replay parent turn context and parent token count
+        // 4. Child turn context
+        // 5. Child B unique token count
+        let lines_b = vec![
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"019f7daa-3ffd-71d1-8ced-671d3035ae0a","forked_from_id":"019f5976-f447-7b70-ae8c-016344ed5588"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"019f5976-f447-7b70-ae8c-016344ed5588"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.2","turn_id":"019f5976-f447-7b70-ae8c-016344ed5589"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":20},"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":20}}}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-5.2","turn_id":"019f7dab-3ffd-71d1-8ced-671d3035ae0a"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"cached_input_tokens":0,"output_tokens":30},"last_token_usage":{"input_tokens":20,"cached_input_tokens":0,"output_tokens":10}}}}"#,
+        ].join("\n");
+
+        let file_a = create_test_file(&lines_a);
+        let file_b = create_test_file(&lines_b);
+
+        let messages_a = parse_codex_file(file_a.path());
+        let messages_b = parse_codex_file(file_b.path());
+
+        println!("--- DEBUG TEST ---");
+        for (i, msg) in messages_a.iter().enumerate() {
+            println!("  messages_a[{}] = ts={} model={} in={} out={} dedup={:?}", i, msg.timestamp, msg.model_id, msg.tokens.input, msg.tokens.output, msg.dedup_key);
+        }
+        println!("------------------");
+
+        // Subagent A:
+        // - Parent replay is skipped by the replay gate
+        // - Child turn 1: first step (10 input, 5 output)
+        // - Child turn 1: second step (15 input total, delta is 5 input, 0 output)
+        // Total messages emitted by parser for A should be 2.
+        assert_eq!(messages_a.len(), 2);
+        assert_eq!(messages_a[0].tokens.input, 10);
+        assert_eq!(messages_a[0].tokens.output, 5);
+        assert_eq!(messages_a[1].tokens.input, 5); // Delta from 10 to 15 is 5
+        assert_eq!(messages_a[1].tokens.output, 0);
+
+        // Subagent B:
+        // - Parent replay is skipped
+        // - Child B turn 1: 20 input, 10 output
+        assert_eq!(messages_b.len(), 1);
+        assert_eq!(messages_b[0].tokens.input, 20);
+        assert_eq!(messages_b[0].tokens.output, 10);
+
+        // Deduplication test:
+        // We filter messages across both subagent files using a global deduplication set
+        let mut seen_keys = std::collections::HashSet::new();
+        
+        let mut filtered_messages = Vec::new();
+        for msg in messages_a.into_iter().chain(messages_b.into_iter()) {
+            if msg.dedup_key.as_ref().is_none() || seen_keys.insert(msg.dedup_key.clone().unwrap()) {
+                filtered_messages.push(msg);
+            }
+        }
+
+        // Both subagents' unique work must survive deduplication (3 messages total)
+        assert_eq!(filtered_messages.len(), 3);
     }
 }
