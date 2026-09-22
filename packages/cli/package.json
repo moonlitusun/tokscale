@@ -36,7 +36,8 @@
     "tokenusage-cli-linux-arm64-gnu": "4.5.3",
     "tokenusage-cli-linux-arm64-musl": "4.5.3",
     "tokenusage-cli-win32-x64-msvc": "4.5.3",
-    "tokenusage-cli-win32-arm64-msvc": "4.5.3"
+    "tokenusage-cli-win32-arm64-msvc": "4.5.3",
+    "tokenusage-cli-android-arm64": "4.5.3"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
@@ -49,6 +50,8 @@
     "cursor",
     "gemini",
     "codex",
+    "fx",
+    "omp",
     "cli"
   ]
 }

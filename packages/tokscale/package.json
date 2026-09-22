@@ -1,7 +1,7 @@
 {
   "name": "tokenusage",
   "version": "4.5.3",
-  "description": "Alias for @tokenusage/cli \u2014 A high-performance CLI tool and visualization dashboard for tracking AI coding assistant token usage and costs across multiple platforms.",
+  "description": "Alias for @tokenusage/cli — A high-performance CLI tool and visualization dashboard for tracking AI coding assistant token usage and costs across multiple platforms.",
   "type": "module",
   "main": "index.js",
   "bin": {
@@ -24,6 +24,8 @@
     "openai",
     "gemini",
     "cursor",
+    "fx",
+    "omp",
     "cli"
   ],
   "dependencies": {

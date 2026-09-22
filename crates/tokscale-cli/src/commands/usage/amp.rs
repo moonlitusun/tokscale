@@ -22,7 +22,7 @@ struct ApiResult {
 }
 
 fn read_credentials() -> Result<String> {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let home = crate::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let path = home
         .join(".local")
         .join("share")
@@ -131,7 +131,7 @@ fn detect_plan(metrics: &[UsageMetric]) -> Option<String> {
 }
 
 pub fn has_credentials() -> bool {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let home = crate::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     home.join(".local")
         .join("share")
         .join("amp")
@@ -146,7 +146,7 @@ pub fn fetch() -> Result<UsageOutput> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let client = reqwest::Client::new();
+        let client = tokscale_core::http::client();
         let resp = client
             .post("https://ampcode.com/api/internal")
             .header("Authorization", format!("Bearer {api_key}"))
@@ -182,6 +182,7 @@ pub fn fetch() -> Result<UsageOutput> {
         Ok(UsageOutput {
             provider: "Amp".into(),
             account: None,
+            credential_source: None,
             plan,
             email: None,
             metrics,

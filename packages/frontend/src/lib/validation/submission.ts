@@ -29,6 +29,16 @@ const TOKEN_ABSOLUTE_TOLERANCE = 100;
 const NonNegativeIntegerSchema = z.number().finite().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const NonNegativeNumberSchema = z.number().finite().min(0);
 
+// Keep the protocol field calendar-safe even while the allocator deliberately
+// treats its client-reported value as unverified metadata.
+const RetentionFloorSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(
+  (value) => {
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+  },
+  { message: "Invalid calendar date" },
+);
+
 const TokenBreakdownSchema = z.object({
   input: NonNegativeIntegerSchema,
   output: NonNegativeIntegerSchema,
@@ -41,6 +51,11 @@ const ClientContributionProvenanceSchema = z.object({
   schemaVersion: NonNegativeIntegerSchema.min(1),
   messageCount: NonNegativeIntegerSchema,
   modelCount: NonNegativeIntegerSchema,
+  // Per-client origin tag; the submit route stamps "backfill" on every client
+  // of a backfill-origin submission before persisting into
+  // daily_breakdown.source_breakdown. Optional so existing CLIs (which never
+  // send it) are unaffected.
+  origin: z.enum(["cli", "backfill"]).optional(),
 });
 
 const CcMirrorSourceSchema = z.string().regex(
@@ -67,6 +82,19 @@ const DailyContributionSchema = z.object({
     tokens: NonNegativeIntegerSchema,
     cost: NonNegativeNumberSchema,
     messages: NonNegativeIntegerSchema,
+    /**
+     * Whether `cost` accounts for every token counted in `tokens`.
+     *
+     * `cost` alone cannot distinguish "this day cost $0.00" from "I could not
+     * price this day", and the write path overwrites cost per day, so a client
+     * with degraded pricing coverage would silently lower recorded spend
+     * (#1044). Sending `false` declares the cost a floor rather than a total,
+     * and the server then refuses to let it reduce what is already stored.
+     *
+     * Optional, and absent means complete — every already-released CLI keeps
+     * exact overwrite semantics, including downward corrections.
+     */
+    costIsComplete: z.boolean().optional(),
   }),
   intensity: NonNegativeIntegerSchema.max(4),
   tokenBreakdown: TokenBreakdownSchema,
@@ -178,13 +206,63 @@ const TimeMetricsSchema = z.object({
   sessionCount: z.number().int().min(0),
 });
 
+/**
+ * Submission-level provenance: distinguishes usage the CLI computed from raw
+ * local session files ("cli") from usage recovered out of a third-party
+ * aggregate export via `tokscale import` ("backfill"). Backfilled aggregates
+ * are not independently verifiable the way locally-scanned sessions are.
+ *
+ * NOTE (https://github.com/junhoyeo/tokscale/issues/888): Phase 1 persistence
+ * has landed. The submit route now (a) sets the sticky `submissions.has_backfill`
+ * flag when origin === "backfill" (never reset by later live submits), and
+ * (b) stamps `origin: "backfill"` into each client's provenance inside
+ * `daily_breakdown.source_breakdown`. The flag is surfaced as an
+ * "includes imported history" badge on profiles. Segregating backfilled data
+ * in RANKING (e.g. excluding it from competitive totals, or a separate
+ * "imported" view) is still TODO in the leaderboard queries, so a "backfill"
+ * submission must not yet be treated as ranked-equivalent to live CLI usage.
+ *
+ * Optional, so existing CLIs (which omit it) are unaffected, and excluded from
+ * `generateSubmissionHash` below since it is derived metadata.
+ */
+const SubmissionProvenanceSchema = z.object({
+  origin: z.enum(["cli", "backfill"]),
+  // Free-form importer id (e.g. "clawdboard"); bounded so it stays a label.
+  importer: z.string().trim().min(1).max(64).optional(),
+});
+
 const SubmissionDataSchema = z.preprocess(normalizeLegacySources, z.object({
   meta: ExportMetaSchema,
   device: SubmitDeviceSchema.optional(),
+  // Parser identity and snapshot completeness are separate: date-filtered
+  // scans still identify their parser but cannot establish/advance a
+  // cumulative rollout high-water.
+  scanScope: z.object({
+    parserVersions: z.record(SourceSchema, NonNegativeIntegerSchema.min(1)),
+    fullHistory: z.boolean(),
+    // Retained protocol metadata. The high-water cannot yet use it as proof
+    // that local history was pruned.
+    retentionFloors: z
+      .record(SourceSchema, RetentionFloorSchema)
+      .optional(),
+  }).optional(),
   summary: DataSummarySchema,
   years: z.array(YearSummarySchema),
-  contributions: z.array(DailyContributionSchema),
+  // Each date must appear at most once. The submit route builds its insert
+  // batch from a date-keyed map of EXISTING rows that is not updated as the
+  // loop runs, so a repeated date produces two rows with the same
+  // (submission_id, submitted_device_id, date). Postgres then either aborts
+  // the statement ("ON CONFLICT DO UPDATE command cannot affect row a second
+  // time") or, if the duplicates land in different INSERT chunks, lets the
+  // second silently overwrite the first through the ON CONFLICT arm --
+  // bypassing the monotonic active-time guard. Rejecting up front turns both
+  // into a clear 400.
+  contributions: z.array(DailyContributionSchema).refine(
+    (days) => new Set(days.map((day) => day.date)).size === days.length,
+    { message: "Duplicate dates in contributions: each date may appear at most once" }
+  ),
   timeMetrics: TimeMetricsSchema.optional(),
+  provenance: SubmissionProvenanceSchema.optional(),
 }));
 
 export type SubmissionData = z.infer<typeof SubmissionDataSchema>;

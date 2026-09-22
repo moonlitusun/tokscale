@@ -13,7 +13,21 @@ export interface ProfileOverviewProps {
   stats: ProfileStatsData;
   lastUpdated?: string | null;
   period?: "all" | "month" | "week";
+  /**
+   * Zone for the two absolute instants rendered here — "Updated" and "Joined".
+   * Defaults to the viewer's browser zone. Never applies to contribution
+   * dates: those are calendar buckets the submitting machine already resolved.
+   */
+  timeZone?: string;
   className?: string;
+}
+
+export function getProfileRankLabel(
+  period: NonNullable<ProfileOverviewProps["period"]>,
+): string {
+  if (period === "month") return "30d rank";
+  if (period === "week") return "7d rank";
+  return "All-time rank";
 }
 
 const OverviewPanel = styled.section`
@@ -303,24 +317,35 @@ const subscribeNoop = () => () => {};
 export function formatLastUpdated(
   lastUpdated: string | null | undefined,
   isMounted: boolean,
+  timeZone?: string,
 ): string | null {
   if (!lastUpdated) return null;
   const date = new Date(lastUpdated);
   return isMounted
-    ? date.toLocaleString("en-US")
+    ? date.toLocaleString("en-US", timeZone ? { timeZone } : undefined)
     : date.toLocaleString("en-US", { timeZone: "UTC" });
 }
 
-function formatJoined(createdAt: string | null | undefined): string | null {
+/**
+ * "Joined" is an absolute instant (`users.createdAt`), so projecting it into the
+ * viewer's chosen zone is meaningful and two viewers may legitimately read a
+ * different month across a UTC boundary. Contribution dates never take this
+ * path — see src/lib/timezone.ts.
+ */
+export function formatJoined(
+  createdAt: string | null | undefined,
+  timeZone?: string,
+): string | null {
   if (!createdAt) return null;
   const date = new Date(createdAt);
   if (Number.isNaN(date.getTime())) return null;
 
-  return date.toLocaleDateString("en-US", {
+  const options: Intl.DateTimeFormatOptions = {
     month: "short",
     year: "numeric",
-    timeZone: "UTC",
-  });
+  };
+  if (timeZone) options.timeZone = timeZone;
+  return date.toLocaleDateString("en-US", options);
 }
 
 export function ProfileOverview({
@@ -328,6 +353,7 @@ export function ProfileOverview({
   stats,
   lastUpdated,
   period = "all",
+  timeZone,
   className,
 }: ProfileOverviewProps) {
   const [isEmbedDialogOpen, setIsEmbedDialogOpen] = useState(false);
@@ -337,10 +363,13 @@ export function ProfileOverview({
     () => false,
   );
   const formattedLastUpdated = useMemo(
-    () => formatLastUpdated(lastUpdated, isMounted),
-    [isMounted, lastUpdated],
+    () => formatLastUpdated(lastUpdated, isMounted, timeZone),
+    [isMounted, lastUpdated, timeZone],
   );
-  const joined = useMemo(() => formatJoined(user.createdAt), [user.createdAt]);
+  const joined = useMemo(
+    () => formatJoined(user.createdAt, isMounted ? timeZone : "UTC"),
+    [user.createdAt, isMounted, timeZone],
+  );
   const displayName = user.displayName || user.username;
   const avatarUrl = user.avatarUrl || `https://github.com/${user.username}.png`;
 
@@ -421,7 +450,7 @@ export function ProfileOverview({
               <Metadata aria-label="Profile details">
                 {user.rank != null && (
                   <RankItem>
-                    <span>Rank</span>
+                    <span>{getProfileRankLabel(period)}</span>
                     <strong>#{user.rank.toLocaleString("en-US")}</strong>
                   </RankItem>
                 )}

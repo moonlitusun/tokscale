@@ -149,7 +149,7 @@ pub fn fetch() -> Result<UsageOutput> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let client = reqwest::Client::new();
+        let client = tokscale_core::http::client();
         let resp = fetch_api(&client, &api_key).await?;
 
         if is_auth_error(&resp) {
@@ -247,6 +247,7 @@ pub fn fetch() -> Result<UsageOutput> {
         Ok(UsageOutput {
             provider: "MiniMax".into(),
             account: None,
+            credential_source: None,
             plan,
             email: None,
             metrics,

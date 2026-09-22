@@ -1,8 +1,9 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::widgets::{
-    format_cost, format_tokens, get_client_color, get_client_display_name, viewport_scrollbar_state,
+    ambient_stable_scrollbar, format_cost, format_tokens, get_client_color,
+    get_client_display_name, viewport_scrollbar_state, AMBIENT_STABLE_BORDER_SET,
 };
 use crate::tui::app::{App, ClickAction};
 
@@ -71,6 +72,7 @@ fn render_graph(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(theme_border))
         .title(Span::styled(
             " Contribution Graph (52 weeks) ",
@@ -142,14 +144,14 @@ fn render_graph(frame: &mut Frame, app: &mut App, area: Rect) {
                 Some(day) => {
                     let color = intensity_color(day.intensity);
                     if is_selected {
-                        ("▓▓", Style::default().fg(Color::White).bg(color))
+                        ("▓▓", app.theme.graph_cell_selected_style(color))
                     } else {
                         ("██", Style::default().fg(color))
                     }
                 }
                 None => {
                     if is_selected {
-                        ("▓▓", Style::default().fg(Color::White).bg(theme_colors[0]))
+                        ("▓▓", app.theme.graph_cell_selected_style(theme_colors[0]))
                     } else {
                         ("· ", subtle_text_style)
                     }
@@ -195,6 +197,7 @@ fn render_graph(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " Stats ",
@@ -222,7 +225,11 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
                 .flat_map(|w| w.iter())
                 .filter_map(|d| d.as_ref())
                 .map(|d| d.tokens)
-                .sum()
+                // Plain `.sum()` panics (debug) / wraps (release) if a single
+                // corrupt/huge day's token count overflows u64 across the
+                // graph; saturate instead so one bad day doesn't poison the
+                // whole panel's total.
+                .fold(0u64, u64::saturating_add)
         })
         .unwrap_or(0);
 
@@ -268,7 +275,7 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     });
     let favorite_model_name = favorite_model.map(|m| m.model.as_str()).unwrap_or("N/A");
     let model_color = favorite_model
-        .map(|m| app.model_color_for(&m.provider, &m.model))
+        .map(|m| app.model_color_for(&m.provider, &m.color_key))
         .unwrap_or_else(|| app.model_color("N/A"));
     let sessions: u32 = app.data.models.iter().map(|m| m.session_count).sum();
 
@@ -301,10 +308,7 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     let row1_col2 = Line::from(vec![
         Span::styled(tokens_label, Style::default().fg(app.theme.muted)),
         Span::raw(" "),
-        Span::styled(
-            format_tokens(total_tokens),
-            Style::default().fg(Color::Cyan),
-        ),
+        Span::styled(format_tokens(total_tokens), app.theme.count_style()),
     ]);
     frame.render_widget(
         Paragraph::new(row1_col2),
@@ -319,7 +323,7 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     let row2 = Line::from(vec![
         Span::styled("Sessions:", Style::default().fg(app.theme.muted)),
         Span::raw(" "),
-        Span::styled(sessions.to_string(), Style::default().fg(Color::Cyan)),
+        Span::styled(sessions.to_string(), app.theme.count_style()),
     ]);
     frame.render_widget(Paragraph::new(row2), Rect::new(inner.x, y, col1_width, 1));
 
@@ -350,7 +354,7 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(
             format!("{} days", app.data.current_streak),
-            Style::default().fg(Color::Cyan),
+            app.theme.count_style(),
         ),
     ]);
     frame.render_widget(Paragraph::new(row3), Rect::new(inner.x, y, col1_width, 1));
@@ -365,7 +369,7 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(
             format!("{} days", app.data.longest_streak),
-            Style::default().fg(Color::Cyan),
+            app.theme.count_style(),
         ),
     ]);
     frame.render_widget(
@@ -384,7 +388,7 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(
             format!("{}/{}", active_days, total_days),
-            Style::default().fg(Color::Cyan),
+            app.theme.count_style(),
         ),
     ]);
     frame.render_widget(
@@ -427,7 +431,7 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
                 total_cost
             ),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app.theme.hint_key_color())
                 .add_modifier(Modifier::ITALIC),
         ));
         frame.render_widget(
@@ -440,6 +444,7 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
 fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " Day Breakdown (ESC to close) ",
@@ -489,11 +494,11 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(
                 day.date.format("%a, %b %d, %Y").to_string(),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(app.theme.foreground)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(format_tokens(day.tokens), Style::default().fg(Color::Cyan)),
+            Span::styled(format_tokens(day.tokens), app.theme.count_style()),
             Span::raw("  "),
             Span::styled(
                 format_cost(day.cost),
@@ -554,7 +559,7 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                         Span::styled("●", Style::default().fg(model_color)),
                         Span::styled(
                             format!(" {}", truncate_model_name(&model_info.display_name, 25)),
-                            Style::default().fg(Color::White),
+                            Style::default().fg(app.theme.foreground),
                         ),
                     ]));
 
@@ -637,9 +642,7 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(paragraph, inner);
 
     if app.stats_breakdown_total_lines > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state = viewport_scrollbar_state(
             app.stats_breakdown_total_lines,
@@ -670,5 +673,68 @@ fn truncate_model_name(s: &str, max_chars: usize) -> String {
     } else {
         let head: String = s.chars().take(max_chars - 1).collect();
         format!("{}…", head)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::TuiConfig;
+    use crate::tui::data::{ContributionDay, GraphData};
+    use chrono::NaiveDate;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn make_app() -> App {
+        let config = TuiConfig {
+            theme: "blue".to_string(),
+            refresh: 0,
+            sessions_path: None,
+            clients: None,
+            since: None,
+            until: None,
+            year: None,
+            initial_tab: None,
+            ..Default::default()
+        };
+        App::new_with_cached_data(config, None).unwrap()
+    }
+
+    fn corrupt_day(date: NaiveDate) -> ContributionDay {
+        ContributionDay {
+            date,
+            tokens: u64::MAX,
+            cost: 0.0,
+            intensity: 1.0,
+        }
+    }
+
+    #[test]
+    fn saturated_graph_days_render_without_overflowing_total() {
+        let mut app = make_app();
+        // Three days each at u64::MAX: no single day overflows, but a plain
+        // `.sum()` across them does. render_stats_panel must saturate
+        // instead of panicking (debug) or wrapping (release).
+        app.data.graph = Some(GraphData {
+            weeks: vec![vec![
+                Some(corrupt_day(NaiveDate::from_ymd_opt(2026, 5, 27).unwrap())),
+                Some(corrupt_day(NaiveDate::from_ymd_opt(2026, 5, 28).unwrap())),
+                Some(corrupt_day(NaiveDate::from_ymd_opt(2026, 5, 29).unwrap())),
+            ]],
+        });
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_stats_panel(frame, &app, Rect::new(0, 0, 80, 20)))
+            .unwrap();
+
+        let body = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect::<String>();
+        assert!(!body.trim().is_empty());
     }
 }

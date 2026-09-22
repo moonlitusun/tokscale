@@ -3,9 +3,10 @@ import { notFound, permanentRedirect } from 'next/navigation';
 import type { ProfileDevice } from '@/components/profile';
 import { loadPublicProfileDevicesForPage } from '@/lib/publicProfileDevices';
 import { loadPublicProfileForPage } from '@/lib/publicProfileData';
+import { profileUrl } from '@/lib/seo/urls';
+import { getSession } from '@/lib/auth/session';
+import { getModerationNotice } from '@/lib/moderation/notice';
 import ProfilePageClient, { type ProfileData } from './ProfilePageClient';
-
-export const revalidate = 60;
 
 const PROFILE_PERIODS = ["all", "week", "month"] as const;
 type ProfilePeriod = (typeof PROFILE_PERIODS)[number];
@@ -59,25 +60,27 @@ export async function generateMetadata({ params }: { params: Promise<{ username:
   return {
     title: `@${username} - Token Usage | Tokscale`,
     description: `View ${username}'s AI token usage statistics and cost breakdown on Tokscale`,
+    // ?period=all|week|month all render this same profile over a different
+    // window, so they consolidate onto the bare URL. Safe to build from the
+    // request param: a non-canonical casing permanent-redirects below rather
+    // than rendering, so this only ever runs for the canonical spelling.
+    alternates: {
+      canonical: profileUrl(username),
+    },
+    // No `images` on either block: opengraph-image.tsx in this directory
+    // supplies a card rendered from this user's real numbers. Setting an
+    // explicit images array here would override it with the generic
+    // site-wide PNG, which is what every profile used to share.
     openGraph: {
       title: `@${username}'s Token Usage | Tokscale`,
       description: `AI token usage statistics for ${username} on Tokscale`,
       type: 'profile',
-      url: `https://tokscale.ai/u/${username}`,
+      url: profileUrl(username),
       siteName: 'Tokscale',
-      images: [
-        {
-          url: 'https://tokscale.ai/og-image.png',
-          width: 1200,
-          height: 630,
-          alt: `${username}'s Token Usage on Tokscale`,
-        },
-      ],
     },
     twitter: {
       card: 'summary_large_image',
       title: `@${username}'s Token Usage | Tokscale`,
-      images: ['https://tokscale.ai/og-image.png'],
     },
   };
 }
@@ -105,5 +108,35 @@ export default async function ProfilePage({
     permanentRedirect(`/u/${data.user.username}${period === "all" ? "" : `?period=${period}`}`);
   }
 
-  return <ProfilePageClient initialData={data} initialDevices={devices} username={username} />;
+  // Fetched outside the cached public payload: publicProfileData is
+  // unstable_cache'd and also backs /api/users/<username>, so carrying
+  // moderation state in it would publish the decision through the JSON API as
+  // a side effect of putting it on the page.
+  //
+  // Shown to everyone, but worded by audience. A failed session lookup means we
+  // could not establish ownership, so it falls through to the public wording
+  // rather than showing a stranger copy that addresses them as the owner.
+  //
+  // Now that this runs for every viewer and not just the owner, a database
+  // hiccup here would take down every profile page rather than one. A visitor
+  // loses only the banner and still gets a working profile; the owner keeps
+  // the error, because someone who cannot see why their account is missing
+  // from the leaderboard is the one person the failure actually matters to.
+  const session = await getSession().catch(() => null);
+  const isOwner = Boolean(session && data.user?.id && session.id === data.user.id);
+  const moderationNotice = data.user?.id
+    ? await getModerationNotice(data.user.id, isOwner ? "owner" : "public").catch((error) => {
+        if (isOwner) throw error;
+        return null;
+      })
+    : null;
+
+  return (
+    <ProfilePageClient
+      initialData={data}
+      initialDevices={devices}
+      username={username}
+      moderationNotice={moderationNotice}
+    />
+  );
 }

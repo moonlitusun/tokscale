@@ -8,6 +8,7 @@ import {
   vi,
 } from "vitest";
 
+import { createContributionCalendar } from "../../src/components/profile/ProfileContributionGraph";
 import { expectNoNarrowedCostCast } from "../support/costCastWidths";
 
 const mockState = vi.hoisted(() => {
@@ -126,6 +127,10 @@ const mockState = vi.hoisted(() => {
   };
 });
 
+const unstableCacheMock = vi.hoisted(() => vi.fn((fn: () => unknown) => fn));
+
+vi.mock("next/cache", () => ({ unstable_cache: unstableCacheMock }));
+
 vi.mock("@/lib/db", () => ({
   db: mockState.db,
   users: mockState.tables.users,
@@ -183,6 +188,11 @@ function serializeSqlCalls(): string[] {
   });
 }
 
+/** Whitespace-insensitive view of a query, for asserting on a whole clause. */
+function collapseSql(text: string | undefined): string {
+  return (text ?? "").replace(/\s+/g, " ").trim();
+}
+
 beforeAll(async () => {
   const routeModule = await import("../../src/app/api/users/[username]/route");
   GET = routeModule.GET;
@@ -190,6 +200,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   mockState.reset();
+  unstableCacheMock.mockClear();
 });
 
 afterEach(() => {
@@ -538,6 +549,136 @@ describe("GET /api/users/[username]", () => {
     ]);
   });
 
+  it("merges client model breakdowns without mutating the stored daily rows", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-12T12:00:00.000Z"));
+
+    mockState.pushSelectResult([
+      {
+        id: "user-1",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 35,
+        totalCost: 2.25,
+        inputTokens: 30,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 1,
+        earliestDate: "2026-04-30",
+        latestDate: "2026-05-01",
+        sessionCount: 0,
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        sourcesUsed: ["codex", "kilo"],
+        modelsUsed: ["gpt-5.5", "k-1"],
+        updatedAt: new Date("2026-05-01T12:00:00.000Z"),
+        cliVersion: "2.0.0",
+        schemaVersion: 2,
+      },
+    ]);
+
+    const model = (
+      tokens: number,
+      cost: number,
+      input: number,
+      output: number,
+    ) => ({
+      tokens,
+      cost,
+      input,
+      output,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      messages: 1,
+    });
+    // Two shapes that both make the aggregator adopt a stored `models` map and
+    // then merge a second breakdown into it: same-date rows from two devices,
+    // and a single row whose `kilocode` key folds onto `kilo`.
+    const dailyRows = [
+      {
+        date: "2026-04-30",
+        timestampMs: 100,
+        tokens: 10,
+        cost: "1.0000",
+        inputTokens: 10,
+        outputTokens: 0,
+        sourceBreakdown: {
+          codex: {
+            ...model(10, 1, 10, 0),
+            models: { "gpt-5.5": model(10, 1, 10, 0) },
+          },
+        },
+      },
+      {
+        date: "2026-04-30",
+        timestampMs: 200,
+        tokens: 15,
+        cost: "0.7500",
+        inputTokens: 10,
+        outputTokens: 5,
+        sourceBreakdown: {
+          codex: {
+            ...model(15, 0.75, 10, 5),
+            models: { "gpt-5.5": model(15, 0.75, 10, 5) },
+          },
+        },
+      },
+      {
+        date: "2026-05-01",
+        timestampMs: 300,
+        tokens: 10,
+        cost: "0.5000",
+        inputTokens: 10,
+        outputTokens: 0,
+        sourceBreakdown: {
+          kilocode: {
+            ...model(4, 0.2, 4, 0),
+            models: { "k-1": model(4, 0.2, 4, 0) },
+          },
+          kilo: {
+            ...model(6, 0.3, 6, 0),
+            models: { "k-1": model(6, 0.3, 6, 0) },
+          },
+        },
+      },
+    ];
+    const storedRows = structuredClone(dailyRows);
+    mockState.pushSelectResult(dailyRows);
+    mockState.pushExecuteResult([{ rank: 1 }]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice"),
+      { params: Promise.resolve({ username: "alice" }) },
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.contributions[0].clients[0].models).toEqual({
+      "gpt-5.5": expect.objectContaining({ tokens: 25, cost: 1.75 }),
+    });
+    expect(body.contributions[1].clients[0].client).toBe("kilo");
+    expect(body.contributions[1].clients[0].models).toEqual({
+      "k-1": expect.objectContaining({ tokens: 10, cost: 0.5 }),
+    });
+
+    // The rows are query results, not scratch space. Accumulating into one in
+    // place leaves the row reporting a merged total it never carried, which is
+    // only harmless while nothing reads it twice — an invariant no caller of
+    // this loop states or is obliged to keep.
+    expect(dailyRows).toEqual(storedRows);
+  });
+
   it("clamps leap-day rolling ranges to the prior year's last valid day", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2024-02-29T12:00:00.000Z"));
@@ -582,7 +723,380 @@ describe("GET /api/users/[username]", () => {
     });
   });
 
-  it("recalculates profile overview stats from daily rows for rolling periods", async () => {
+  it("ends the lifetime range on the newest submitted date when it is ahead of UTC today", async () => {
+    // 2026-07-23T16:00Z is still the 23rd in UTC — and in America/Los_Angeles —
+    // but already the 24th in Asia/Seoul. The owner's CLI bucketed that session
+    // into their local 2026-07-24 and submitted it. The range is resolved here,
+    // on the server, from the data: no viewer's clock is an input, so the day
+    // is visible to a Los Angeles reader exactly as it is to a Seoul one.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-23T16:00:00.000Z"));
+
+    mockState.pushSelectResult([
+      {
+        id: "user-ahead-of-utc",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 35,
+        totalCost: 3.5,
+        inputTokens: 20,
+        outputTokens: 15,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 2,
+        earliestDate: "2026-07-22",
+        latestDate: "2026-07-24",
+        sessionCount: 2,
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        sourcesUsed: ["codex"],
+        modelsUsed: ["gpt-5.5"],
+        updatedAt: new Date("2026-07-23T15:00:00.000Z"),
+        cliVersion: "2.0.0",
+        schemaVersion: 2,
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        date: "2026-07-22",
+        timestampMs: 100,
+        tokens: 10,
+        cost: "1.0000",
+        inputTokens: 6,
+        outputTokens: 4,
+        sourceBreakdown: {
+          codex: {
+            tokens: 10,
+            cost: 1,
+            input: 6,
+            output: 4,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+            messages: 1,
+            models: {
+              "gpt-5.5": {
+                tokens: 10,
+                cost: 1,
+                input: 6,
+                output: 4,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0,
+                messages: 1,
+              },
+            },
+          },
+        },
+      },
+      {
+        date: "2026-07-24",
+        timestampMs: 200,
+        tokens: 25,
+        cost: "2.5000",
+        inputTokens: 14,
+        outputTokens: 11,
+        sourceBreakdown: {
+          codex: {
+            tokens: 25,
+            cost: 2.5,
+            input: 14,
+            output: 11,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+            messages: 2,
+            models: {
+              "gpt-5.5": {
+                tokens: 25,
+                cost: 2.5,
+                input: 14,
+                output: 11,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0,
+                messages: 2,
+              },
+            },
+          },
+        },
+      },
+    ]);
+    mockState.pushExecuteResult([{ rank: 1 }]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice"),
+      { params: Promise.resolve({ username: "alice" }) },
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.chartRange).toEqual({
+      start: "2025-07-24",
+      end: "2026-07-24",
+    });
+    expect(body.dateRange.end).toBe("2026-07-24");
+
+    // The graph clips the payload's contributions to the payload's chartRange,
+    // so building the calendar the way the client does is the check that the
+    // newest day actually renders.
+    const calendar = createContributionCalendar(
+      body.contributions,
+      body.chartRange.start,
+      body.chartRange.end,
+    );
+    expect(calendar.endDate).toBe("2026-07-24");
+    expect(calendar.cells.find(({ date }) => date === "2026-07-24")).toEqual(
+      expect.objectContaining({ inRange: true, tokens: 25 }),
+    );
+
+    // ProfileOverview's "Active days (1y)" and the graph's own count sit on the
+    // same screen; both must be scoped to the same window.
+    expect(body.stats.activeDays).toBe(2);
+    expect(calendar.activeDays).toBe(body.stats.activeDays);
+  });
+
+  it("falls back to UTC today when the newest submitted date is unusable", async () => {
+    // A `date` column cannot hold this, but the anchor now feeds a Date
+    // constructor, and a public profile must not 500 on a malformed value.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-23T16:00:00.000Z"));
+
+    mockState.pushSelectResult([
+      {
+        id: "user-bad-date",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 0,
+        totalCost: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 0,
+        earliestDate: "2026-07-22",
+        latestDate: "2026-13-45",
+      },
+    ]);
+    mockState.pushSelectResult([]);
+    mockState.pushSelectResult([]);
+    mockState.pushExecuteResult([]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice"),
+      { params: Promise.resolve({ username: "alice" }) },
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.chartRange).toEqual({
+      start: "2025-07-23",
+      end: "2026-07-23",
+    });
+  });
+
+  it("ends the 7d window on the newest submitted date when it is ahead of UTC today", async () => {
+    // Same owner-ahead-of-UTC case as the lifetime range, on the 7d tab. The
+    // anchor is not known when the daily query is built, so the query reaches
+    // back from UTC today and the window trims the front: seven days ending on
+    // 2026-07-24, not seven days ending on 2026-07-23 with the newest day cut.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-23T16:00:00.000Z"));
+
+    const breakdownFor = (
+      client: string,
+      model: string,
+      tokens: number,
+      cost: number,
+      input: number,
+      output: number,
+    ) => ({
+      [client]: {
+        tokens,
+        cost,
+        input,
+        output,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        messages: 1,
+        models: {
+          [model]: {
+            tokens,
+            cost,
+            input,
+            output,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+            messages: 1,
+          },
+        },
+      },
+    });
+
+    mockState.pushSelectResult([
+      {
+        id: "user-ahead-of-utc",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 125,
+        totalCost: 13.5,
+        inputTokens: 74,
+        outputTokens: 51,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 3,
+        earliestDate: "2026-07-17",
+        latestDate: "2026-07-24",
+        sessionCount: 3,
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        sourcesUsed: ["codex", "claude"],
+        modelsUsed: ["gpt-5.5", "gpt-legacy"],
+        updatedAt: new Date("2026-07-23T15:00:00.000Z"),
+        cliVersion: "2.0.0",
+        schemaVersion: 2,
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        // Fetched (the query reaches back from UTC today) but one day before the
+        // anchored window starts. Its cost is the largest of the three, so an
+        // intensity scale that still saw it would flatten the two days that do
+        // render.
+        date: "2026-07-17",
+        timestampMs: 50,
+        tokens: 90,
+        cost: "10.0000",
+        inputTokens: 54,
+        outputTokens: 36,
+        sourceBreakdown: breakdownFor("claude", "gpt-legacy", 90, 10, 54, 36),
+      },
+      {
+        date: "2026-07-22",
+        timestampMs: 100,
+        tokens: 10,
+        cost: "1.0000",
+        inputTokens: 6,
+        outputTokens: 4,
+        sourceBreakdown: breakdownFor("codex", "gpt-5.5", 10, 1, 6, 4),
+      },
+      {
+        date: "2026-07-24",
+        timestampMs: 200,
+        tokens: 25,
+        cost: "2.5000",
+        inputTokens: 14,
+        outputTokens: 11,
+        sourceBreakdown: breakdownFor("codex", "gpt-5.5", 25, 2.5, 14, 11),
+      },
+    ]);
+    mockState.pushExecuteResult([{ rank: 1 }]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice?period=week"),
+      { params: Promise.resolve({ username: "alice" }) },
+    );
+    const body = await response.json();
+    const sqlTexts = serializeSqlCalls();
+
+    expect(response.status).toBe(200);
+    expect(mockState.gte).toHaveBeenCalledWith(
+      mockState.tables.dailyBreakdown.date,
+      "2026-07-17",
+    );
+    expect(mockState.lte).not.toHaveBeenCalled();
+    expect(body.chartRange).toEqual({
+      start: "2026-07-18",
+      end: "2026-07-24",
+    });
+    expect(body.dateRange).toEqual({ start: "2026-07-18", end: "2026-07-24" });
+    expect(body.user.rank).toBe(1);
+    expect(
+      sqlTexts.some(
+        (text) =>
+          text.includes("FROM daily_breakdown d") &&
+          text.includes("ROW_NUMBER() OVER") &&
+          text.includes("d.date >= 2026-07-18") &&
+          text.includes("d.date <= 2026-07-24"),
+      ),
+    ).toBe(true);
+    // The cache key carries the anchored window, not the one measured back
+    // from UTC today, so a moved anchor is a different cache entry.
+    expect(unstableCacheMock).toHaveBeenCalledWith(
+      expect.any(Function),
+      ["profile-period-rank", "user-ahead-of-utc", "2026-07-18", "2026-07-24"],
+      {
+        revalidate: 60,
+        tags: ["leaderboard", "user:alice"],
+      },
+    );
+    expect(body.stats).toEqual(
+      expect.objectContaining({
+        totalTokens: 35,
+        totalCost: 3.5,
+        inputTokens: 20,
+        outputTokens: 15,
+        activeDays: 2,
+      }),
+    );
+
+    // Everything scoped to the window agrees with it: the payload's days, the
+    // intensity scale built from them, and the period-scoped metadata.
+    expect(body.contributions.map((day: { date: string }) => day.date)).toEqual(
+      ["2026-07-22", "2026-07-24"],
+    );
+    expect(
+      body.contributions.map((day: { intensity: number }) => day.intensity),
+    ).toEqual([2, 4]);
+    expect(body.clients).toEqual(["codex"]);
+    expect(body.models).toEqual(["gpt-5.5"]);
+
+    const calendar = createContributionCalendar(
+      body.contributions,
+      body.chartRange.start,
+      body.chartRange.end,
+    );
+    expect(calendar.endDate).toBe("2026-07-24");
+    expect(calendar.cells.find(({ date }) => date === "2026-07-24")).toEqual(
+      expect.objectContaining({ inRange: true, tokens: 25 }),
+    );
+    expect(calendar.activeDays).toBe(body.stats.activeDays);
+  });
+
+  async function assertRollingProfilePeriod({
+    period,
+    start,
+  }: {
+    period: "week" | "month";
+    start: string;
+  }) {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-28T12:00:00.000Z"));
 
@@ -688,22 +1202,40 @@ describe("GET /api/users/[username]", () => {
     mockState.pushExecuteResult([{ rank: 4 }]);
 
     const response = await GET(
-      new Request("http://localhost:3000/api/users/alice?period=week"),
+      new Request(`http://localhost:3000/api/users/alice?period=${period}`),
       { params: Promise.resolve({ username: "alice" }) },
     );
     const body = await response.json();
+    const sqlTexts = serializeSqlCalls();
 
     expect(response.status).toBe(200);
     expect(mockState.gte).toHaveBeenCalledWith(
       mockState.tables.dailyBreakdown.date,
-      "2026-06-22",
+      start,
     );
-    expect(mockState.lte).toHaveBeenCalledWith(
-      mockState.tables.dailyBreakdown.date,
-      "2026-06-28",
+    // No upper bound in SQL: the window's end is the anchor, which is not known
+    // when the query is built, and no row can sit above it anyway.
+    expect(mockState.lte).not.toHaveBeenCalled();
+    expect(body.period).toBe(period);
+    expect(body.dateRange).toEqual({ start, end: "2026-06-28" });
+    expect(body.user.rank).toBe(4);
+    expect(
+      sqlTexts.some(
+        (text) =>
+          text.includes("FROM daily_breakdown d") &&
+          text.includes("ROW_NUMBER() OVER") &&
+          text.includes(`d.date >= ${start}`) &&
+          text.includes("d.date <= 2026-06-28"),
+      ),
+    ).toBe(true);
+    expect(unstableCacheMock).toHaveBeenCalledWith(
+      expect.any(Function),
+      ["profile-period-rank", "user-1", start, "2026-06-28"],
+      {
+        revalidate: 60,
+        tags: ["leaderboard", "user:alice"],
+      },
     );
-    expect(body.period).toBe("week");
-    expect(body.dateRange).toEqual({ start: "2026-06-22", end: "2026-06-28" });
     expect(body.stats).toEqual(
       expect.objectContaining({
         totalTokens: 500,
@@ -719,6 +1251,201 @@ describe("GET /api/users/[username]", () => {
     );
     expect(body.clients).toEqual(["codex", "claude"]);
     expect(body.models).toEqual(["gpt-5.5", "claude-sonnet-4-5"]);
+  }
+
+  it.each([
+    { period: "week", start: "2026-06-22" },
+    { period: "month", start: "2026-05-30" },
+  ] as const)(
+    "recalculates profile overview stats and rank for the $period period",
+    assertRollingProfilePeriod,
+  );
+
+  it("ranks the profile period window the way the leaderboard's period tab does", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-28T12:00:00.000Z"));
+
+    mockState.pushSelectResult([
+      {
+        id: "user-1",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 300,
+        totalCost: 3,
+        inputTokens: 180,
+        outputTokens: 120,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 1,
+        earliestDate: "2026-06-28",
+        latestDate: "2026-06-28",
+        sessionCount: 1,
+      },
+    ]);
+    mockState.pushSelectResult([]);
+    mockState.pushSelectResult([
+      {
+        date: "2026-06-28",
+        timestampMs: 100,
+        tokens: 300,
+        cost: "3.0000",
+        inputTokens: 180,
+        outputTokens: 120,
+        sourceBreakdown: null,
+      },
+    ]);
+    // postgres-js hands a bigint rank back as a string.
+    mockState.pushExecuteResult([{ rank: "2" }]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice?period=week"),
+      { params: Promise.resolve({ username: "alice" }) },
+    );
+    const body = await response.json();
+    const sqlTexts = serializeSqlCalls();
+    const periodRankSql = sqlTexts.find((text) =>
+      text.includes("ROW_NUMBER() OVER"),
+    );
+
+    expect(response.status).toBe(200);
+    expect(body.user.rank).toBe(2);
+    // Two users on the same token total have to read the same two distinct
+    // positions here and on the leaderboard's period tab, so the window clause
+    // has to match it term for term.
+    expect(periodRankSql).toBeDefined();
+    expect(collapseSql(periodRankSql)).toContain(
+      "ROW_NUMBER() OVER (ORDER BY total_tokens DESC, total_cost DESC, LOWER(username) ASC, user_id ASC) as rank",
+    );
+    // Shared RANK is what this window used to emit, and it is what made a tie
+    // read one number on the profile and another on the leaderboard.
+    expect(sqlTexts.some((text) => text.includes("RANK() OVER"))).toBe(false);
+    // Only the ordering within a tie changed: the same rows are ranked.
+    expect(collapseSql(periodRankSql)).toContain(
+      "WHERE u.leaderboard_hidden = false AND d.date >= 2026-06-22 AND d.date <= 2026-06-28",
+    );
+    expect(collapseSql(periodRankSql)).toContain(
+      "GROUP BY s.user_id, u.username",
+    );
+    expect(unstableCacheMock).toHaveBeenCalledWith(
+      expect.any(Function),
+      ["profile-period-rank", "user-1", "2026-06-22", "2026-06-28"],
+      {
+        revalidate: 60,
+        tags: ["leaderboard", "user:alice"],
+      },
+    );
+  });
+
+  it("keeps the lifetime profile rank on shared RANK", async () => {
+    mockState.pushSelectResult([
+      {
+        id: "user-1",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 1000,
+        totalCost: 10,
+        inputTokens: 600,
+        outputTokens: 400,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 1,
+        earliestDate: "2026-01-01",
+        latestDate: "2026-06-28",
+        sessionCount: 1,
+      },
+    ]);
+    mockState.pushSelectResult([]);
+    mockState.pushSelectResult([]);
+    mockState.pushExecuteResult([{ rank: "3" }]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice"),
+      { params: Promise.resolve({ username: "alice" }) },
+    );
+    const body = await response.json();
+    const sqlTexts = serializeSqlCalls();
+
+    expect(response.status).toBe(200);
+    expect(body.user.rank).toBe(3);
+    // The leaderboard's all-time tab shares one position between tied users.
+    // Ranking this window sequentially would be the same divergence mirrored.
+    expect(
+      sqlTexts.some((text) =>
+        collapseSql(text).includes(
+          "RANK() OVER (ORDER BY total_tokens DESC) as rank",
+        ),
+      ),
+    ).toBe(true);
+    expect(sqlTexts.some((text) => text.includes("ROW_NUMBER"))).toBe(false);
+  });
+
+  it("skips the period rank scan when the user has no daily rows in the window", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-28T12:00:00.000Z"));
+
+    mockState.pushSelectResult([
+      {
+        id: "user-1",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 1000,
+        totalCost: 10,
+        inputTokens: 600,
+        outputTokens: 400,
+        cacheReadTokens: 100,
+        cacheCreationTokens: 50,
+        reasoningTokens: 25,
+        submissionCount: 3,
+        earliestDate: "2026-01-01",
+        latestDate: "2026-01-15",
+        sessionCount: 8,
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        sourcesUsed: ["codex"],
+        modelsUsed: ["gpt-5.5"],
+        updatedAt: new Date("2026-01-15T10:00:00.000Z"),
+        cliVersion: "2.0.0",
+        schemaVersion: 2,
+      },
+    ]);
+    // The daily query only reaches back seven days, and this user's rows all
+    // predate the window.
+    mockState.pushSelectResult([]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice?period=week"),
+      { params: Promise.resolve({ username: "alice" }) },
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    // A user with no rows in the window has no row in the ranked CTE either,
+    // so the answer is known without scanning every user's daily rows.
+    expect(body.user.rank).toBeNull();
+    expect(mockState.db.execute).not.toHaveBeenCalled();
+    expect(unstableCacheMock).not.toHaveBeenCalled();
   });
 
   it("returns submission freshness metadata for the latest submission", async () => {

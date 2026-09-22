@@ -22,6 +22,24 @@ struct Auth {
     tokens: Option<Tokens>,
 }
 
+#[derive(Debug, Deserialize)]
+struct OpenCodeAuthDocument {
+    openai: Option<OpenCodeCredential>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum OpenCodeCredential {
+    #[serde(rename = "oauth")]
+    Oauth {
+        access: String,
+        #[serde(rename = "accountId")]
+        account_id: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Tokens {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,8 +187,82 @@ pub struct CodexAccountInfo {
 #[derive(Debug, Clone)]
 enum CredentialSource {
     File(PathBuf),
+    OpenCodeFile(PathBuf),
     Keychain,
     Store(String),
+}
+
+impl CredentialSource {
+    /// The account whose tokens tokscale may refresh and write back, if any.
+    ///
+    /// Only [`Self::Store`] qualifies: that is tokscale's own
+    /// `<config>/codex-credentials.json`. [`Self::File`] is the codex CLI's
+    /// `auth.json`, [`Self::Keychain`] is its Keychain item, and
+    /// [`Self::OpenCodeFile`] belongs to OpenCode. The OpenCode adapter does not
+    /// even deserialize its refresh token; writing either Codex-owned source
+    /// destroys keys tokscale does not model (see [`auth_document`]), which is
+    /// #1001 made against the codex CLI.
+    ///
+    /// This is ownership of the *file*, which is not the same as ownership of
+    /// the OAuth grant, and the difference is not academic: a store entry can be
+    /// a verbatim copy of the codex CLI's live tokens, and the TUI surface
+    /// copies them in on its own via [`fetch_all_report_importing_current_auth`]
+    /// rather than waiting for an explicit import. So refreshing a store entry
+    /// can still spend a refresh token the codex CLI is holding. That hazard
+    /// predates this guard and is not what this guard fixes; closing it needs
+    /// grant provenance, not a storage-location check.
+    fn refreshable_account_id(&self) -> Option<&str> {
+        match self {
+            Self::Store(account_id) => Some(account_id),
+            Self::File(_) | Self::OpenCodeFile(_) | Self::Keychain => None,
+        }
+    }
+
+    /// Names the credential in user-facing errors so recovery points at the
+    /// application that owns the rejected login.
+    fn describe(&self) -> String {
+        match self {
+            Self::File(path) => path.display().to_string(),
+            Self::OpenCodeFile(path) => format!("OpenCode auth at {}", path.display()),
+            Self::Keychain => "the Codex Keychain item".to_string(),
+            Self::Store(account_id) => format!("tokscale account '{account_id}'"),
+        }
+    }
+
+    fn reauthentication_guidance(&self) -> &'static str {
+        match self {
+            Self::OpenCodeFile(_) => {
+                "Run OpenCode and reconnect OpenAI with '/connect', then retry."
+            }
+            Self::File(_) | Self::Keychain | Self::Store(_) => {
+                "Run 'codex' so the Codex CLI can refresh its own login, then retry."
+            }
+        }
+    }
+}
+
+/// The chatgpt.com / auth.openai.com endpoints the usage path talks to.
+///
+/// Injected rather than hardcoded so tests can point them at a local server.
+/// The token endpoint is the load-bearing one: the regression this guards
+/// against is a *reintroduced request*, and a hardcoded absolute URL would send
+/// that request to the real auth server where no test could observe it.
+#[derive(Debug, Clone)]
+struct CodexEndpoints {
+    usage: String,
+    reset_credits: String,
+    token: String,
+}
+
+impl CodexEndpoints {
+    fn production() -> Self {
+        Self {
+            usage: "https://chatgpt.com/backend-api/wham/usage".to_string(),
+            reset_credits: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+                .to_string(),
+            token: "https://auth.openai.com/oauth/token".to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -359,7 +451,7 @@ impl CodexAccountStore {
 }
 
 fn current_auth_paths() -> Vec<PathBuf> {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let home = crate::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let mut paths = Vec::new();
 
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
@@ -371,6 +463,48 @@ fn current_auth_paths() -> Vec<PathBuf> {
     paths.push(home.join(".config").join("codex").join("auth.json"));
     paths.push(home.join(".codex").join("auth.json"));
     paths
+}
+
+fn opencode_auth_path() -> PathBuf {
+    let data_dir = std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            crate::paths::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local")
+                .join("share")
+        });
+    data_dir.join("opencode").join("auth.json")
+}
+
+fn read_opencode_credentials_at(path: &Path) -> Result<Option<(Auth, CredentialSource)>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read OpenCode auth from {}", path.display()))?;
+    let document = serde_json::from_str::<OpenCodeAuthDocument>(&content)
+        .with_context(|| format!("Failed to parse OpenCode auth from {}", path.display()))?;
+    let Some(OpenCodeCredential::Oauth {
+        access, account_id, ..
+    }) = document.openai
+    else {
+        return Ok(None);
+    };
+
+    if access.trim().is_empty() {
+        anyhow::bail!("OpenCode OAuth entry has no access token");
+    }
+
+    Ok(Some((
+        Auth {
+            tokens: Some(Tokens {
+                access_token: Some(access),
+                refresh_token: None,
+                account_id,
+                id_token: None,
+            }),
+        },
+        CredentialSource::OpenCodeFile(path.to_path_buf()),
+    )))
 }
 
 /// Where `switch` writes the codex CLI auth. Derived from
@@ -428,6 +562,18 @@ fn read_current_credentials() -> Result<(Auth, CredentialSource)> {
     Err(CodexUsageError::MissingCredentials.into())
 }
 
+/// Builds a codex `auth.json` body from `tokens` alone, discarding everything
+/// else the document held.
+///
+/// The codex CLI's own `AuthDotJson` carries seven top-level keys --
+/// `auth_mode`, `OPENAI_API_KEY`, `tokens`, `last_refresh`, `agent_identity`,
+/// `personal_access_token`, `bedrock_api_key` -- and this writes two of them.
+/// The other five are deleted, and three of those (`OPENAI_API_KEY`,
+/// `agent_identity`, `bedrock_api_key`) are standalone credentials, so the write
+/// can take a user's API key with it. That is why the only caller left is
+/// [`switch_active_account`], where repointing codex at another account is the
+/// user's explicit request. The usage path must never reach here: it is a
+/// reader, and #1001 is what happens when a reader writes.
 fn auth_document(tokens: &Tokens) -> serde_json::Value {
     serde_json::json!({
         "tokens": tokens,
@@ -441,19 +587,15 @@ fn save_auth_tokens(path: &Path, tokens: &Tokens) -> Result<()> {
         .with_context(|| format!("Failed to write Codex auth to {}", path.display()))
 }
 
-fn persist_tokens(source: &CredentialSource, tokens: &Tokens) {
-    match source {
-        CredentialSource::File(path) => {
-            if let Err(e) = save_auth_tokens(path, tokens) {
-                eprintln!("warning: failed to save Codex credentials: {e}");
-            }
-        }
-        CredentialSource::Store(account_id) => {
-            if let Err(e) = update_account_tokens(account_id, tokens.clone()) {
-                eprintln!("warning: failed to save Codex account credentials: {e}");
-            }
-        }
-        CredentialSource::Keychain => {}
+/// Writes refreshed tokens back to tokscale's own account store, and nowhere
+/// else. Sources tokscale does not own are silently skipped rather than
+/// diverted to a different file -- they have no destination by design.
+fn persist_refreshed_tokens(source: &CredentialSource, tokens: &Tokens) {
+    let Some(account_id) = source.refreshable_account_id() else {
+        return;
+    };
+    if let Err(e) = update_account_tokens(account_id, tokens.clone()) {
+        eprintln!("warning: failed to save Codex account credentials: {e}");
     }
 }
 
@@ -957,7 +1099,7 @@ fn auth_from_account(account: &CodexAccount) -> Auth {
     }
 }
 
-pub fn has_credentials() -> bool {
+fn has_native_credentials() -> bool {
     if load_credentials_store()
         .map(|store| !store.accounts.is_empty())
         .unwrap_or(false)
@@ -968,9 +1110,33 @@ pub fn has_credentials() -> bool {
     read_current_credentials().is_ok()
 }
 
-async fn refresh_token(client: &reqwest::Client, rt: &str) -> Result<Refresh> {
+fn has_opencode_auth_candidate_at(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.is_file(),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn has_opencode_usage_candidate_at(path: &Path) -> bool {
+    if !has_opencode_auth_candidate_at(path) {
+        return false;
+    }
+
+    // Keep malformed or unreadable files active so the fetch path can report
+    // the owning path instead of silently suppressing Codex usage.
+    match read_opencode_credentials_at(path) {
+        Ok(Some(_)) | Err(_) => true,
+        Ok(None) => false,
+    }
+}
+
+pub fn has_credentials() -> bool {
+    has_native_credentials() || has_opencode_usage_candidate_at(&opencode_auth_path())
+}
+
+async fn refresh_token(client: &reqwest::Client, token_url: &str, rt: &str) -> Result<Refresh> {
     let resp = client
-        .post("https://auth.openai.com/oauth/token")
+        .post(token_url)
         .form(&[
             ("grant_type", "refresh_token"),
             ("client_id", CLIENT_ID),
@@ -1011,11 +1177,12 @@ where
 
 async fn fetch_usage(
     client: &reqwest::Client,
+    usage_url: &str,
     token: &str,
     account_id: Option<&str>,
 ) -> Result<Usage> {
     let mut req = client
-        .get("https://chatgpt.com/backend-api/wham/usage")
+        .get(usage_url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/json")
         .header(
@@ -1031,11 +1198,12 @@ async fn fetch_usage(
 
 async fn fetch_reset_credits(
     client: &reqwest::Client,
+    reset_credits_url: &str,
     token: &str,
     account_id: Option<&str>,
 ) -> Result<ResetCreditsResponse> {
     let mut req = client
-        .get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")
+        .get(reset_credits_url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/json")
         .header(
@@ -1209,6 +1377,7 @@ fn json_scalar_string(value: Option<serde_json::Value>) -> Option<String> {
 }
 
 async fn fetch_with_auth_async(
+    endpoints: &CodexEndpoints,
     auth: Auth,
     source: CredentialSource,
     provider_name: String,
@@ -1222,17 +1391,37 @@ async fn fetch_with_auth_async(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("No Codex access token."))?;
 
-    let client = reqwest::Client::new();
+    let client = tokscale_core::http::client();
     let mut effective_tokens = tokens.clone();
     let mut effective_access_token = access_token.clone();
-    let resp = match fetch_usage(&client, &access_token, tokens.account_id.as_deref()).await {
+    let resp = match fetch_usage(
+        &client,
+        &endpoints.usage,
+        &access_token,
+        tokens.account_id.as_deref(),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) if is_needs_auth(&e) => {
+            // A rejected token is only tokscale's to renew when tokscale is the
+            // one storing it. For the codex CLI's own auth.json or Keychain
+            // item, refreshing would spend a refresh token the CLI is still
+            // holding and rotate it out from under it -- the usage command is a
+            // reader, so it stops here and says so.
+            if source.refreshable_account_id().is_none() {
+                return Err(e.context(format!(
+                    "Codex usage unavailable: the access token in {} was rejected. \
+                     {}",
+                    source.describe(),
+                    source.reauthentication_guidance()
+                )));
+            }
             let rt_str = tokens
                 .refresh_token
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("No refresh token."))?;
-            let refreshed = refresh_token(&client, rt_str).await?;
+            let refreshed = refresh_token(&client, &endpoints.token, rt_str).await?;
             let new = refreshed
                 .access_token
                 .clone()
@@ -1243,11 +1432,17 @@ async fn fetch_with_auth_async(
             if let Some(new_rt) = refreshed.refresh_token {
                 updated_tokens.refresh_token = Some(new_rt);
             }
-            persist_tokens(&source, &updated_tokens);
+            persist_refreshed_tokens(&source, &updated_tokens);
             effective_access_token = new.clone();
             effective_tokens = updated_tokens.clone();
 
-            fetch_usage(&client, &new, updated_tokens.account_id.as_deref()).await?
+            fetch_usage(
+                &client,
+                &endpoints.usage,
+                &new,
+                updated_tokens.account_id.as_deref(),
+            )
+            .await?
         }
         Err(e) => return Err(e),
     };
@@ -1272,6 +1467,7 @@ async fn fetch_with_auth_async(
     if should_fetch_reset_details(reset_credits.as_ref()) {
         if let Ok(details) = fetch_reset_credits(
             &client,
+            &endpoints.reset_credits,
             &effective_access_token,
             effective_tokens.account_id.as_deref(),
         )
@@ -1298,6 +1494,7 @@ async fn fetch_with_auth_async(
     Ok(UsageOutput {
         provider: provider_name,
         account,
+        credential_source: None,
         plan,
         email: resp.email,
         metrics,
@@ -1307,7 +1504,12 @@ async fn fetch_with_auth_async(
     })
 }
 
-fn fetch_with_auth(
+/// The whole authenticated usage path, with the endpoints as a parameter.
+/// The refresh-and-write this module was fixed for lived in exactly this
+/// orchestration, so it is the layer the tests must enter; [`fetch_with_auth`]
+/// is one call with the production endpoints and holds no logic of its own.
+fn fetch_with_auth_at(
+    endpoints: &CodexEndpoints,
     auth: Auth,
     source: CredentialSource,
     provider_name: String,
@@ -1316,7 +1518,28 @@ fn fetch_with_auth(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(fetch_with_auth_async(auth, source, provider_name, account))
+    rt.block_on(fetch_with_auth_async(
+        endpoints,
+        auth,
+        source,
+        provider_name,
+        account,
+    ))
+}
+
+fn fetch_with_auth(
+    auth: Auth,
+    source: CredentialSource,
+    provider_name: String,
+    account: Option<UsageAccount>,
+) -> Result<UsageOutput> {
+    fetch_with_auth_at(
+        &CodexEndpoints::production(),
+        auth,
+        source,
+        provider_name,
+        account,
+    )
 }
 
 pub fn fetch() -> Result<UsageOutput> {
@@ -1382,8 +1605,14 @@ fn active_account_id_for_usage(store: &mut CodexCredentialsStore) -> Option<Stri
     active_account_id
 }
 
-fn fetch_current_auth_report(diagnostics: Vec<UsageFetchDiagnostic>) -> UsageFetchReport {
-    match fetch() {
+fn fetch_current_auth_report_at(
+    diagnostics: Vec<UsageFetchDiagnostic>,
+    endpoints: &CodexEndpoints,
+) -> UsageFetchReport {
+    let result = read_current_credentials().and_then(|(auth, source)| {
+        fetch_with_auth_at(endpoints, auth, source, "Codex".into(), None)
+    });
+    match result {
         Ok(output) => UsageFetchReport {
             outputs: vec![output],
             diagnostics,
@@ -1399,6 +1628,42 @@ fn fetch_current_auth_report(diagnostics: Vec<UsageFetchDiagnostic>) -> UsageFet
     }
 }
 
+fn append_opencode_fallback_at(
+    mut report: UsageFetchReport,
+    auth_path: &Path,
+    endpoints: &CodexEndpoints,
+) -> UsageFetchReport {
+    if !report.outputs.is_empty() {
+        return report;
+    }
+
+    let credentials = match read_opencode_credentials_at(auth_path) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            report
+                .diagnostics
+                .push(UsageFetchDiagnostic::new("Codex", None, error.to_string()));
+            return report;
+        }
+    };
+    let Some((auth, source)) = credentials else {
+        return report;
+    };
+
+    match fetch_with_auth_at(endpoints, auth, source, "Codex".into(), None) {
+        Ok(mut output) => {
+            output.credential_source = Some("opencode".to_string());
+            report.outputs.push(output);
+        }
+        Err(error) => {
+            report
+                .diagnostics
+                .push(UsageFetchDiagnostic::new("Codex", None, error.to_string()))
+        }
+    }
+    report
+}
+
 pub fn fetch_all() -> Result<Vec<UsageOutput>> {
     let report = fetch_all_report();
     if report.outputs.is_empty() {
@@ -1410,11 +1675,39 @@ pub fn fetch_all() -> Result<Vec<UsageOutput>> {
 }
 
 pub fn fetch_all_report() -> UsageFetchReport {
-    fetch_all_report_inner(CodexFetchIntent::ReadOnly)
+    let endpoints = CodexEndpoints::production();
+    fetch_all_report_with_opencode_fallback_at(
+        CodexFetchIntent::ReadOnly,
+        &endpoints,
+        &opencode_auth_path(),
+    )
 }
 
 pub fn fetch_all_report_importing_current_auth() -> UsageFetchReport {
-    fetch_all_report_inner(CodexFetchIntent::SaveCurrentLogin)
+    let endpoints = CodexEndpoints::production();
+    fetch_all_report_with_opencode_fallback_at(
+        CodexFetchIntent::SaveCurrentLogin,
+        &endpoints,
+        &opencode_auth_path(),
+    )
+}
+
+fn fetch_all_report_with_opencode_fallback_at(
+    intent: CodexFetchIntent,
+    endpoints: &CodexEndpoints,
+    auth_path: &Path,
+) -> UsageFetchReport {
+    let report = if has_native_credentials() {
+        fetch_all_report_inner_at(intent, endpoints)
+    } else {
+        UsageFetchReport::default()
+    };
+
+    if has_opencode_auth_candidate_at(auth_path) {
+        append_opencode_fallback_at(report, auth_path, endpoints)
+    } else {
+        report
+    }
 }
 
 fn load_credentials_store_for_fetch_intent(
@@ -1429,7 +1722,10 @@ fn load_credentials_store_for_fetch_intent(
     }
 }
 
-fn fetch_all_report_inner(intent: CodexFetchIntent) -> UsageFetchReport {
+fn fetch_all_report_inner_at(
+    intent: CodexFetchIntent,
+    endpoints: &CodexEndpoints,
+) -> UsageFetchReport {
     let mut diagnostics = Vec::new();
     let current_auth_account = if intent == CodexFetchIntent::SaveCurrentLogin {
         match save_current_auth_account() {
@@ -1452,11 +1748,11 @@ fn fetch_all_report_inner(intent: CodexFetchIntent) -> UsageFetchReport {
     };
 
     let Some(mut store) = load_credentials_store_for_fetch_intent(intent) else {
-        return fetch_current_auth_report(diagnostics);
+        return fetch_current_auth_report_at(diagnostics, endpoints);
     };
 
     if store.accounts.is_empty() {
-        return fetch_current_auth_report(diagnostics);
+        return fetch_current_auth_report_at(diagnostics, endpoints);
     }
 
     let active_account_id = current_auth_account
@@ -1492,7 +1788,8 @@ fn fetch_all_report_inner(intent: CodexFetchIntent) -> UsageFetchReport {
         };
         let usage_account =
             usage_account_from_saved(&account_id, account, active_account_id.as_deref());
-        match fetch_with_auth(
+        match fetch_with_auth_at(
+            endpoints,
             auth_from_account(account),
             CredentialSource::Store(account_id.clone()),
             "Codex".into(),
@@ -1524,7 +1821,7 @@ async fn consume_reset_credit_with_auth_async(
         .access_token
         .clone()
         .ok_or_else(|| anyhow::anyhow!("No Codex access token."))?;
-    let client = reqwest::Client::new();
+    let client = tokscale_core::http::client();
     let redeem_request_id = uuid::Uuid::new_v4().to_string();
 
     match consume_reset_credit(
@@ -1537,11 +1834,23 @@ async fn consume_reset_credit_with_auth_async(
     {
         Ok(result) => Ok(result),
         Err(e) if is_needs_auth(&e) => {
+            // Every caller today passes `Store`, so this guard changes no
+            // current behaviour. It is here so the ownership rule is a property
+            // of both refresh sites rather than something the usage path
+            // enforces and this one happens not to violate.
+            if source.refreshable_account_id().is_none() {
+                return Err(e.context(format!(
+                    "Codex reset credit unavailable: the access token in {} was rejected. \
+                     Run 'codex' so the Codex CLI can refresh its own login, then retry.",
+                    source.describe()
+                )));
+            }
             let rt_str = tokens
                 .refresh_token
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("No refresh token."))?;
-            let refreshed = refresh_token(&client, rt_str).await?;
+            let refreshed =
+                refresh_token(&client, &CodexEndpoints::production().token, rt_str).await?;
             let new = refreshed
                 .access_token
                 .clone()
@@ -1552,7 +1861,7 @@ async fn consume_reset_credit_with_auth_async(
             if let Some(new_rt) = refreshed.refresh_token {
                 updated_tokens.refresh_token = Some(new_rt);
             }
-            persist_tokens(&source, &updated_tokens);
+            persist_refreshed_tokens(&source, &updated_tokens);
 
             consume_reset_credit(
                 &client,
@@ -1816,7 +2125,10 @@ pub fn run_codex_status(name: Option<String>, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    use crate::commands::usage::test_server::{spawn_server, Seen};
 
     fn test_store_path(tmp: &TempDir) -> PathBuf {
         tmp.path().join("codex-credentials.json")
@@ -2871,6 +3183,626 @@ mod tests {
             "unexpected error: {error}"
         );
         assert_eq!(std::fs::read_to_string(&store_path)?, future_store);
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // #1001 / #1005: tokscale must not write the codex CLI's auth.json.
+    // ---------------------------------------------------------------------
+
+    /// A codex CLI `auth.json` as the CLI actually writes it. Every key outside
+    /// `tokens` is one `auth_document` would delete: `OPENAI_API_KEY`,
+    /// `agent_identity` and `bedrock_api_key` are standalone credentials,
+    /// `auth_mode` decides which of them codex uses, and the unknown key stands
+    /// in for the next field codex adds -- it owns this schema, not tokscale.
+    const CODEX_AUTH_FIXTURE: &str = r#"{
+  "auth_mode": "chatgpt",
+  "OPENAI_API_KEY": "sk-user-owned-api-key",
+  "tokens": {
+    "id_token": "codex-owned-id-token",
+    "access_token": "stale-access-token",
+    "refresh_token": "codex-owned-refresh-token",
+    "account_id": "acct_codex"
+  },
+  "last_refresh": "2026-07-01T00:00:00Z",
+  "agent_identity": "codex-owned-agent-jwt",
+  "personal_access_token": "codex-owned-pat",
+  "bedrock_api_key": { "key": "codex-owned-bedrock-key" },
+  "someKeyTokscaleDoesNotModel": { "keep": true }
+}"#;
+
+    const OPENCODE_AUTH_FIXTURE: &str = r#"{
+  "anthropic": {
+    "type": "api",
+    "key": "unrelated-provider-key"
+  },
+  "openai": {
+    "type": "oauth",
+    "refresh": "opencode-owned-refresh-token",
+    "access": "opencode-access-token",
+    "expires": 1786089600000,
+    "accountId": "acct_opencode"
+  }
+}"#;
+
+    #[test]
+    fn opencode_oauth_maps_only_read_only_usage_credentials() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(&auth_path, OPENCODE_AUTH_FIXTURE)?;
+
+        let (auth, source) = read_opencode_credentials_at(&auth_path)?
+            .expect("OpenCode OAuth credentials should be detected");
+        let tokens = auth.tokens.expect("mapped tokens");
+
+        assert_eq!(
+            tokens.access_token.as_deref(),
+            Some("opencode-access-token")
+        );
+        assert_eq!(tokens.account_id.as_deref(), Some("acct_opencode"));
+        assert!(tokens.refresh_token.is_none());
+        assert!(tokens.id_token.is_none());
+        assert!(matches!(source, CredentialSource::OpenCodeFile(path) if path == auth_path));
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_api_key_is_not_a_chatgpt_usage_credential() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"openai":{"type":"api","key":"sk-openai-api-key"}}"#,
+        )?;
+
+        assert!(read_opencode_credentials_at(&auth_path)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(not(target_os = "macos"))]
+    fn opencode_api_key_does_not_activate_codex_usage() -> Result<()> {
+        let home = TempDir::new()?;
+        let config = TempDir::new()?;
+        let codex_home = TempDir::new()?;
+        let xdg_data = TempDir::new()?;
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
+        let _config_guard = EnvVarGuard::set_path("TOKSCALE_CONFIG_DIR", config.path());
+        let _codex_guard = EnvVarGuard::set_path("CODEX_HOME", codex_home.path());
+        let _xdg_data_guard = EnvVarGuard::set_path("XDG_DATA_HOME", xdg_data.path());
+        let auth_path = xdg_data.path().join("opencode").join("auth.json");
+        std::fs::create_dir_all(auth_path.parent().expect("auth parent"))?;
+        std::fs::write(
+            &auth_path,
+            r#"{"openai":{"type":"api","key":"sk-openai-api-key"}}"#,
+        )?;
+
+        assert!(!has_credentials());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_opencode_auth_remains_a_usage_candidate() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(&auth_path, "not json")?;
+
+        assert!(has_opencode_usage_candidate_at(&auth_path));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_opencode_oauth_is_reported_with_its_path() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"openai":{"type":"oauth","refresh":"refresh","expires":1}}"#,
+        )?;
+
+        let error = read_opencode_credentials_at(&auth_path)
+            .expect_err("OAuth without an access token must not be accepted");
+        assert!(error.to_string().contains("Failed to parse OpenCode auth"));
+        assert!(error.to_string().contains(&auth_path.display().to_string()));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_auth_path_honors_xdg_data_home() -> Result<()> {
+        let xdg_data = TempDir::new()?;
+        let _guard = EnvVarGuard::set_path("XDG_DATA_HOME", xdg_data.path());
+
+        assert_eq!(
+            opencode_auth_path(),
+            xdg_data.path().join("opencode").join("auth.json")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_fallback_keeps_native_diagnostics_when_it_recovers_usage() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(&auth_path, OPENCODE_AUTH_FIXTURE)?;
+        let (endpoints, log) = spawn_codex_server(vec![200]);
+        let native_report = UsageFetchReport {
+            outputs: Vec::new(),
+            diagnostics: vec![UsageFetchDiagnostic::new(
+                "Codex",
+                None,
+                "saved account token refresh failed",
+            )],
+        };
+
+        let report = append_opencode_fallback_at(native_report, &auth_path, &endpoints);
+
+        assert_eq!(report.outputs.len(), 1);
+        assert_eq!(report.outputs[0].provider, "Codex");
+        assert_eq!(
+            report.outputs[0].credential_source.as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(
+            report.outputs[0].email.as_deref(),
+            Some("codex@example.com")
+        );
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "saved account token refresh failed"
+        );
+        assert_eq!(
+            *log.lock().expect("request log"),
+            vec![Seen {
+                request: format!("GET {USAGE_PATH}"),
+                bearer: Some("opencode-access-token".to_string()),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn successful_native_usage_suppresses_opencode_fallback() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(&auth_path, OPENCODE_AUTH_FIXTURE)?;
+        let (endpoints, log) = spawn_codex_server(vec![200]);
+        let native_output = fetch_with_auth_at(
+            &endpoints,
+            Auth {
+                tokens: Some(tokens("native-codex-access-token", Some("acct_native"))),
+            },
+            CredentialSource::Keychain,
+            "Codex".into(),
+            None,
+        )?;
+
+        let report = append_opencode_fallback_at(
+            UsageFetchReport {
+                outputs: vec![native_output],
+                diagnostics: Vec::new(),
+            },
+            &auth_path,
+            &endpoints,
+        );
+
+        assert_eq!(report.outputs.len(), 1);
+        assert!(report.outputs[0].credential_source.is_none());
+        assert_eq!(
+            *log.lock().expect("request log"),
+            vec![Seen {
+                request: format!("GET {USAGE_PATH}"),
+                bearer: Some("native-codex-access-token".to_string()),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stale_saved_accounts_fall_back_to_opencode_without_hiding_the_failure() -> Result<()> {
+        let config_dir = TempDir::new()?;
+        let _config_guard = EnvVarGuard::set_path("TOKSCALE_CONFIG_DIR", config_dir.path());
+        let store_path = config_dir.path().join("codex-credentials.json");
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "acct_saved".to_string(),
+            CodexAccount {
+                tokens: Tokens {
+                    access_token: Some("stale-saved-access-token".to_string()),
+                    refresh_token: Some("stale-saved-refresh-token".to_string()),
+                    account_id: Some("acct_saved".to_string()),
+                    id_token: None,
+                },
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                label: Some("old".to_string()),
+            },
+        );
+        save_credentials_store_at_path(
+            &store_path,
+            &CodexCredentialsStore {
+                version: 1,
+                active_account_id: "acct_saved".to_string(),
+                accounts,
+            },
+        )?;
+        let store_before = std::fs::read(&store_path)?;
+
+        let opencode_dir = TempDir::new()?;
+        let auth_path = opencode_dir.path().join("auth.json");
+        std::fs::write(&auth_path, OPENCODE_AUTH_FIXTURE)?;
+        let auth_before = std::fs::read(&auth_path)?;
+
+        let (base, log) = spawn_server(|path, request_index| match (path, request_index) {
+            (USAGE_PATH, 0) => (401, "{}".to_string()),
+            (TOKEN_PATH, 1) => (401, "{}".to_string()),
+            (USAGE_PATH, 2) => (200, USAGE_BODY.to_string()),
+            _ => (404, "{}".to_string()),
+        });
+        let endpoints = CodexEndpoints {
+            usage: format!("{base}{USAGE_PATH}"),
+            reset_credits: format!("{base}{RESET_CREDITS_PATH}"),
+            token: format!("{base}{TOKEN_PATH}"),
+        };
+
+        let report = fetch_all_report_with_opencode_fallback_at(
+            CodexFetchIntent::ReadOnly,
+            &endpoints,
+            &auth_path,
+        );
+
+        assert_eq!(report.outputs.len(), 1);
+        assert_eq!(
+            report.outputs[0].credential_source.as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0]
+                .account
+                .as_ref()
+                .map(|account| account.id.as_str()),
+            Some("acct_saved")
+        );
+        assert_eq!(
+            requests(&log),
+            vec![
+                format!("GET {USAGE_PATH}"),
+                format!("POST {TOKEN_PATH}"),
+                format!("GET {USAGE_PATH}"),
+            ]
+        );
+        assert_eq!(std::fs::read(&store_path)?, store_before);
+        assert_eq!(std::fs::read(&auth_path)?, auth_before);
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_opencode_token_is_never_refreshed_or_rewritten() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(&auth_path, OPENCODE_AUTH_FIXTURE)?;
+        let before = std::fs::read(&auth_path)?;
+        let (endpoints, log) = spawn_codex_server(vec![401]);
+
+        let report =
+            append_opencode_fallback_at(UsageFetchReport::default(), &auth_path, &endpoints);
+
+        assert!(report.outputs.is_empty());
+        assert_eq!(std::fs::read(&auth_path)?, before);
+        assert_eq!(
+            requests(&log),
+            vec![format!("GET {USAGE_PATH}")],
+            "OpenCode-owned credentials must never reach the token endpoint"
+        );
+        let diagnostic = report
+            .diagnostics
+            .first()
+            .expect("rejected OpenCode token should be diagnosed");
+        assert!(diagnostic.message.contains("OpenCode"));
+        assert!(diagnostic.message.contains("/connect"));
+        Ok(())
+    }
+
+    /// Path components mirror production so a recorded request line is the same
+    /// string the real endpoints would produce.
+    const USAGE_PATH: &str = "/backend-api/wham/usage";
+    const RESET_CREDITS_PATH: &str = "/backend-api/wham/rate-limit-reset-credits";
+    const TOKEN_PATH: &str = "/oauth/token";
+
+    /// `rate_limit_reset_credits` is present and zero so `should_fetch_reset_details`
+    /// skips the detail GET; that keeps the request count a clean signal rather
+    /// than a number the test has to explain away.
+    const USAGE_BODY: &str = r#"{
+      "email": "codex@example.com",
+      "plan_type": "plus",
+      "rate_limit": {
+        "primary_window": {"used_percent": 12.5, "limit_window_seconds": 18000, "reset_at": 1781929382}
+      },
+      "rate_limit_reset_credits": {"available_count": 0}
+    }"#;
+
+    const REFRESH_BODY: &str = r#"{
+      "access_token": "refreshed-access-token",
+      "refresh_token": "refreshed-refresh-token",
+      "expires_in": 3600
+    }"#;
+
+    fn spawn_codex_server(usage_statuses: Vec<u16>) -> (CodexEndpoints, Arc<Mutex<Vec<Seen>>>) {
+        let mut usage_calls = 0usize;
+        let (base, log) = spawn_server(move |path, _| {
+            if path == USAGE_PATH {
+                let status = usage_statuses
+                    .get(usage_calls)
+                    .copied()
+                    .or_else(|| usage_statuses.last().copied())
+                    .unwrap_or(200);
+                usage_calls += 1;
+                (status, USAGE_BODY.to_string())
+            } else if path == TOKEN_PATH {
+                (200, REFRESH_BODY.to_string())
+            } else if path == RESET_CREDITS_PATH {
+                (200, r#"{"available_count":0,"credits":[]}"#.to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        });
+        (
+            CodexEndpoints {
+                usage: format!("{base}{USAGE_PATH}"),
+                reset_credits: format!("{base}{RESET_CREDITS_PATH}"),
+                token: format!("{base}{TOKEN_PATH}"),
+            },
+            log,
+        )
+    }
+
+    fn requests(log: &Arc<Mutex<Vec<Seen>>>) -> Vec<String> {
+        log.lock()
+            .expect("request log")
+            .iter()
+            .map(|seen| seen.request.clone())
+            .collect()
+    }
+
+    /// The assertion that actually pins the bug. A reintroduced
+    /// refresh-on-codex's-behalf shows up here as a `POST /oauth/token` even if
+    /// it never manages to write a file -- and because the token endpoint is
+    /// injected, that POST lands on this server instead of vanishing into the
+    /// real auth.openai.com where the test could not see it.
+    fn assert_only_usage_request(log: &Arc<Mutex<Vec<Seen>>>) {
+        let seen = log.lock().expect("request log");
+        assert_eq!(
+            *seen,
+            vec![Seen {
+                request: format!("GET {USAGE_PATH}"),
+                // The fixture's token, so this also proves the credential came
+                // from the temp home and not from the developer's real one.
+                bearer: Some("stale-access-token".to_string()),
+            }],
+            "tokscale made a request other than the single usage GET"
+        );
+    }
+
+    /// Points `CODEX_HOME` at a temp dir holding [`CODEX_AUTH_FIXTURE`], so
+    /// tests enter through the production `read_current_credentials` and get a
+    /// genuine `CredentialSource::File` rather than a hand-built one.
+    fn codex_home_with_fixture() -> Result<(TempDir, EnvVarGuard, PathBuf)> {
+        let codex_home = TempDir::new()?;
+        let guard = EnvVarGuard::set_path("CODEX_HOME", codex_home.path());
+        let auth_path = codex_home.path().join("auth.json");
+        std::fs::write(&auth_path, CODEX_AUTH_FIXTURE)?;
+        Ok((codex_home, guard, auth_path))
+    }
+
+    /// #1001, ported to codex: a rejected access token must not make tokscale
+    /// refresh or rewrite the codex CLI's `auth.json`. Byte equality is the
+    /// assertion that matters -- any reconstruction of the document fails it,
+    /// whatever fields it happens to keep.
+    #[test]
+    #[serial_test::serial]
+    fn rejected_token_leaves_codex_auth_json_untouched() -> Result<()> {
+        let (_codex_home, _guard, auth_path) = codex_home_with_fixture()?;
+        let before = std::fs::read(&auth_path)?;
+        let (endpoints, log) = spawn_codex_server(vec![401]);
+
+        let (auth, source) = read_current_credentials()?;
+        assert!(
+            matches!(source, CredentialSource::File(_)),
+            "fixture should be read from disk, got {source:?}"
+        );
+        let result = fetch_with_auth_at(&endpoints, auth, source, "Codex".into(), None);
+
+        // Integrity first: it is the claim the test exists for, and asserting
+        // the error message ahead of it would let a regression report the
+        // weaker failure.
+        assert_eq!(
+            String::from_utf8_lossy(&std::fs::read(&auth_path)?),
+            String::from_utf8_lossy(&before),
+            "tokscale rewrote the codex CLI's auth.json"
+        );
+        assert_only_usage_request(&log);
+
+        let error = result.expect_err("401 must surface as an error, not a refresh");
+        assert!(
+            error.to_string().contains("Run 'codex'"),
+            "error should point at the codex CLI's own login, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("auth.json"),
+            "error should name the rejected credential, got: {error}"
+        );
+        Ok(())
+    }
+
+    /// A 403 takes the same branch as a 401 and must be just as inert.
+    #[test]
+    #[serial_test::serial]
+    fn forbidden_response_leaves_codex_auth_json_untouched() -> Result<()> {
+        let (_codex_home, _guard, auth_path) = codex_home_with_fixture()?;
+        let before = std::fs::read(&auth_path)?;
+        let (endpoints, log) = spawn_codex_server(vec![403]);
+
+        let (auth, source) = read_current_credentials()?;
+        let result = fetch_with_auth_at(&endpoints, auth, source, "Codex".into(), None);
+
+        assert!(result.is_err(), "403 must surface as an error");
+        assert_eq!(
+            String::from_utf8_lossy(&std::fs::read(&auth_path)?),
+            String::from_utf8_lossy(&before),
+            "tokscale rewrote the codex CLI's auth.json"
+        );
+        assert_only_usage_request(&log);
+        Ok(())
+    }
+
+    /// On macOS the credentials can live in the Keychain with no file on disk.
+    ///
+    /// The `!exists()` assertion below is a guard, not the regression: the old
+    /// `persist_tokens` already no-opped on `Keychain`, so no version of this
+    /// code would have created the file. What actually fails here against the
+    /// unfixed code is the request count -- the old path still spent the codex
+    /// CLI's refresh token, it just had nowhere to put the result.
+    #[test]
+    #[serial_test::serial]
+    fn rejected_token_does_not_create_a_codex_auth_file() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let _guard = EnvVarGuard::set_path("CODEX_HOME", codex_home.path());
+        let auth_path = codex_home.path().join("auth.json");
+        let (endpoints, log) = spawn_codex_server(vec![401]);
+
+        let auth: Auth = serde_json::from_str(CODEX_AUTH_FIXTURE)?;
+        let result = fetch_with_auth_at(
+            &endpoints,
+            auth,
+            CredentialSource::Keychain,
+            "Codex".into(),
+            None,
+        );
+
+        assert!(result.is_err(), "401 must surface as an error");
+        assert!(
+            !auth_path.exists(),
+            "tokscale created an auth.json the codex CLI did not have"
+        );
+        assert_only_usage_request(&log);
+        Ok(())
+    }
+
+    /// The success path never had a reason to write, but it shares the
+    /// orchestration, so it is pinned too.
+    #[test]
+    #[serial_test::serial]
+    fn successful_usage_fetch_leaves_codex_auth_json_untouched() -> Result<()> {
+        let (_codex_home, _guard, auth_path) = codex_home_with_fixture()?;
+        let before = std::fs::read(&auth_path)?;
+        let (endpoints, log) = spawn_codex_server(vec![200]);
+
+        let (auth, source) = read_current_credentials()?;
+        let output = fetch_with_auth_at(&endpoints, auth, source, "Codex".into(), None)?;
+
+        assert_eq!(output.email.as_deref(), Some("codex@example.com"));
+        assert_eq!(output.plan.as_deref(), Some("Plus"));
+
+        assert_eq!(
+            String::from_utf8_lossy(&std::fs::read(&auth_path)?),
+            String::from_utf8_lossy(&before),
+            "tokscale rewrote the codex CLI's auth.json"
+        );
+        assert_only_usage_request(&log);
+        Ok(())
+    }
+
+    /// The other half of the rule, and the reason this is not simply "never
+    /// refresh": `<config>/codex-credentials.json` is tokscale's own file, and
+    /// without a refresh every saved account would go stale an hour after
+    /// import, leaving `usage --all` permanently broken.
+    ///
+    /// This pins the boundary, not the bug -- it passes against the unfixed
+    /// code too, which is the point: the guard must not have over-corrected
+    /// into breaking saved accounts. It does not claim the store entry's grant
+    /// is unshared; see [`CredentialSource::refreshable_account_id`].
+    #[test]
+    #[serial_test::serial]
+    fn rejected_token_still_refreshes_tokscale_own_account_store() -> Result<()> {
+        let (_codex_home, _codex_guard, auth_path) = codex_home_with_fixture()?;
+        let auth_before = std::fs::read(&auth_path)?;
+
+        let config_dir = TempDir::new()?;
+        let _config_guard = EnvVarGuard::set_path("TOKSCALE_CONFIG_DIR", config_dir.path());
+        let store_path = config_dir.path().join("codex-credentials.json");
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "acct_saved".to_string(),
+            CodexAccount {
+                tokens: Tokens {
+                    access_token: Some("stale-access-token".to_string()),
+                    refresh_token: Some("tokscale-stored-refresh-token".to_string()),
+                    account_id: Some("acct_saved".to_string()),
+                    id_token: None,
+                },
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                label: Some("work".to_string()),
+            },
+        );
+        save_credentials_store_at_path(
+            &store_path,
+            &CodexCredentialsStore {
+                version: 1,
+                active_account_id: "acct_saved".to_string(),
+                accounts,
+            },
+        )?;
+
+        let (endpoints, log) = spawn_codex_server(vec![401, 200]);
+        let (_id, account, _info) = load_account(Some("acct_saved"))?;
+        let output = fetch_with_auth_at(
+            &endpoints,
+            auth_from_account(&account),
+            CredentialSource::Store("acct_saved".to_string()),
+            "Codex".into(),
+            None,
+        )?;
+
+        assert_eq!(output.email.as_deref(), Some("codex@example.com"));
+        assert_eq!(
+            requests(&log),
+            vec![
+                format!("GET {USAGE_PATH}"),
+                format!("POST {TOKEN_PATH}"),
+                format!("GET {USAGE_PATH}"),
+            ],
+            "the store path should refresh once and retry once"
+        );
+
+        let refreshed = load_credentials_store_from_path(&store_path)
+            .expect("store must still parse")
+            .accounts
+            .remove("acct_saved")
+            .expect("account must survive the refresh");
+        assert_eq!(
+            refreshed.tokens.access_token.as_deref(),
+            Some("refreshed-access-token")
+        );
+        assert_eq!(
+            refreshed.tokens.refresh_token.as_deref(),
+            Some("refreshed-refresh-token")
+        );
+        assert_eq!(
+            refreshed.label.as_deref(),
+            Some("work"),
+            "refreshing tokens must not drop the account's other fields"
+        );
+
+        // The refresh wrote tokscale's own store and nothing else: the codex
+        // CLI's file is untouched even though a refresh did happen.
+        assert_eq!(
+            String::from_utf8_lossy(&std::fs::read(&auth_path)?),
+            String::from_utf8_lossy(&auth_before),
+            "refreshing a saved account must not touch the codex CLI's auth.json"
+        );
         Ok(())
     }
 }

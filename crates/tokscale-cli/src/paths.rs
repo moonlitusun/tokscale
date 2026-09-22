@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 #[allow(unused_imports)]
 pub use tokscale_core::paths::{
-    get_cache_dir, get_config_dir, is_config_dir_overridden, legacy_dirs_cache_dir,
+    get_cache_dir, get_config_dir, home_dir, is_config_dir_overridden, legacy_dirs_cache_dir,
     legacy_dot_cache_tokscale_dir,
 };
 
@@ -38,7 +38,9 @@ pub fn legacy_macos_config_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use serial_test::serial;
+    #[cfg(target_os = "macos")]
     use std::env;
 
     #[test]

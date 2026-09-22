@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,17 @@ fn legacy_cache_files() -> Vec<PathBuf> {
 struct CachedTUIData {
     #[serde(default)]
     schema_version: u32,
+    /// `parser_generation()` at write time.
+    ///
+    /// `schema_version` covers the shape of this file; this covers the shape of
+    /// the *numbers inside it*. A parser fix changes totals without changing
+    /// either the file layout or any of the keys below, so without this a
+    /// pre-fix aggregate is indistinguishable from a current one.
+    ///
+    /// Defaults to 0 for files written before this field existed, which never
+    /// matches a real generation, so those are rebuilt once.
+    #[serde(default)]
+    parser_generation: u64,
     timestamp: u64,
     enabled_clients: Vec<String>,
     #[serde(default)]
@@ -128,6 +139,8 @@ struct CachedTokenBreakdown {
 #[serde(rename_all = "camelCase")]
 struct CachedModelUsage {
     model: String,
+    #[serde(default)]
+    color_key: String,
     provider: String,
     client: String,
     #[serde(default)]
@@ -264,6 +277,7 @@ impl From<&ModelUsage> for CachedModelUsage {
     fn from(m: &ModelUsage) -> Self {
         Self {
             model: m.model.clone(),
+            color_key: m.color_key.clone(),
             provider: m.provider.clone(),
             client: m.client.clone(),
             workspace_key: m.workspace_key.clone(),
@@ -278,8 +292,14 @@ impl From<&ModelUsage> for CachedModelUsage {
 
 impl From<CachedModelUsage> for ModelUsage {
     fn from(m: CachedModelUsage) -> Self {
+        let color_key = if m.color_key.is_empty() {
+            m.model.clone()
+        } else {
+            m.color_key
+        };
         Self {
             model: m.model,
+            color_key,
             provider: m.provider,
             client: m.client,
             workspace_key: m.workspace_key,
@@ -638,6 +658,14 @@ impl TryFrom<CachedUsageData> for UsageData {
             // first foreground refresh after cache hit will populate it.
             minutely: Vec::new(),
             monthly,
+            // Sessions are recomputed on each load (high cardinality, not
+            // worth round-tripping through the on-disk cache); the first
+            // foreground refresh after cache hit will populate it.
+            sessions: Vec::new(),
+            // Projects follow the sessions/minutely precedent: recomputed on
+            // each load so the cache schema does not need a version bump; the
+            // first background refresh after cache hit will populate them.
+            projects: Vec::new(),
             graph: graph.transpose()?,
             total_tokens: u.total_tokens,
             total_cost: u.total_cost,
@@ -746,24 +774,30 @@ pub fn load_cache(
     let Some(cache_path) = cache_file() else {
         return CacheResult::Miss;
     };
-    let cached: Option<CachedTUIData> = match File::open(&cache_path) {
-        Ok(file) => {
-            let reader = BufReader::new(file);
-            serde_json::from_reader(reader).ok()
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            legacy_cache_files().into_iter().find_map(|path| {
-                let file = File::open(path).ok()?;
-                let reader = BufReader::new(file);
-                serde_json::from_reader(reader).ok()
-            })
-        }
-        Err(_) => None,
-    };
-    let Some(cached) = cached else {
+    let Some(cached) = read_cached_payload(&cache_path, &legacy_cache_files()) else {
         return CacheResult::Miss;
     };
+    classify_cached_payload(cached, enabled_clients, group_by, report_scope)
+}
+
+/// Decide whether a payload that was already read off disk is usable, and how
+/// stale it is. Pure given its inputs apart from the current clock, so the
+/// freshness contract can be asserted without redirecting process-global
+/// paths.
+fn classify_cached_payload(
+    cached: CachedTUIData,
+    enabled_clients: &HashSet<ClientFilter>,
+    group_by: &GroupBy,
+    report_scope: &CacheReportScope,
+) -> CacheResult {
     if cached.schema_version > CACHE_SCHEMA_VERSION {
+        return CacheResult::Miss;
+    }
+    // Miss, not Stale. Everything below can still hand back `Stale`, and
+    // `decide_initial_data` paints `Stale` exactly like `Fresh` -- so treating a
+    // parser change as merely stale would show the pre-fix totals anyway, which
+    // is the whole thing this guards against.
+    if cached.parser_generation != tokscale_core::parser_generation() {
         return CacheResult::Miss;
     }
     let schema_outdated = cached.schema_version < CACHE_SCHEMA_VERSION;
@@ -812,6 +846,30 @@ pub fn load_cache(
         CacheResult::Stale(data)
     } else {
         CacheResult::Fresh(data)
+    }
+}
+
+/// Read the cache payload, preferring the canonical path and falling back to
+/// the pre-#470 locations only when the canonical file does not exist.
+///
+/// Split out of [`load_cache`] because the canonical path is not redirectable
+/// in a test: on Windows `get_config_dir()` resolves through
+/// `dirs::config_dir()` (`%APPDATA%`), which no environment variable can move,
+/// while `legacy_dot_cache_tokscale_dir()` follows `$HOME`. A test that drove
+/// this precedence through the environment therefore depended on whatever the
+/// rest of the suite had left in the real `%APPDATA%\tokscale\cache`. Taking
+/// both paths as arguments makes the ordering testable directly.
+///
+/// A canonical file that exists but fails to parse is NOT a reason to read a
+/// legacy file: only `NotFound` opens the fallback.
+fn read_cached_payload(primary: &Path, legacy: &[PathBuf]) -> Option<CachedTUIData> {
+    match File::open(primary) {
+        Ok(file) => serde_json::from_reader(BufReader::new(file)).ok(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => legacy.iter().find_map(|path| {
+            let file = File::open(path).ok()?;
+            serde_json::from_reader(BufReader::new(file)).ok()
+        }),
+        Err(_) => None,
     }
 }
 
@@ -906,6 +964,7 @@ pub fn save_cached_data(
 
     let cached = CachedTUIData {
         schema_version: CACHE_SCHEMA_VERSION,
+        parser_generation: tokscale_core::parser_generation(),
         timestamp,
         enabled_clients: clients_vec,
         include_synthetic,
@@ -946,11 +1005,82 @@ pub fn save_cached_data(
 
 #[cfg(test)]
 mod tests {
+
+    /// Stamps the current parser generation into a hand-written cache fixture.
+    ///
+    /// The fixtures below are raw JSON on purpose -- they pin legacy on-disk
+    /// shapes that no current writer produces. `parserGeneration` is the one
+    /// field that cannot be pinned: it is computed from every client's
+    /// `parser_version`, so hardcoding it would make each of these files need
+    /// editing on every parser bump. Tests that are about generation
+    /// mismatch set it themselves instead of going through this.
+    fn with_current_generation(json: &str) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(json).expect("fixture is valid JSON");
+        value["parserGeneration"] = serde_json::json!(tokscale_core::parser_generation());
+        value.to_string()
+    }
     use super::*;
     use serial_test::serial;
+    use std::ffi::OsString;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, fs};
     use tempfile::TempDir;
+
+    /// Redirect `$HOME` **and** the canonical cache dir at a scratch root.
+    ///
+    /// `$HOME` alone is not enough. `legacy_dot_cache_tokscale_dir()` follows
+    /// `$HOME` on every platform, but `get_config_dir()` only does so on
+    /// macOS/Linux; on Windows it resolves through `dirs::config_dir()`
+    /// (`%APPDATA%`), which no environment variable can move. Every test here
+    /// that writes `cache_file()` was therefore writing the runner's real
+    /// `%APPDATA%\tokscale\cache\tui-data-cache.json` and leaking it into
+    /// whichever test ran next. `TOKSCALE_CONFIG_DIR` is the one knob that
+    /// moves the canonical path on all three platforms.
+    ///
+    /// Restoring on `Drop` rather than at the end of the test body matters for
+    /// the same reason it does in `tokscale_core::paths::test_env`: a failing
+    /// assertion panics before a manual restore runs and leaves `$HOME`
+    /// pointing at a deleted `TempDir` for every later test in the process.
+    /// That helper is `#[cfg(test)] pub(crate)` inside tokscale-core and is not
+    /// reachable from this crate, hence the local copy.
+    struct CacheEnv {
+        home: Option<OsString>,
+        config_dir: Option<OsString>,
+    }
+
+    impl CacheEnv {
+        fn capture() -> Self {
+            Self {
+                home: env::var_os("HOME"),
+                config_dir: env::var_os("TOKSCALE_CONFIG_DIR"),
+            }
+        }
+
+        fn redirect(root: &Path) -> Self {
+            let saved = Self::capture();
+            unsafe {
+                env::set_var("HOME", root);
+                env::set_var("TOKSCALE_CONFIG_DIR", root.join("config"));
+            }
+            saved
+        }
+    }
+
+    impl Drop for CacheEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.home {
+                    Some(value) => env::set_var("HOME", value),
+                    None => env::remove_var("HOME"),
+                }
+                match &self.config_dir {
+                    Some(value) => env::set_var("TOKSCALE_CONFIG_DIR", value),
+                    None => env::remove_var("TOKSCALE_CONFIG_DIR"),
+                }
+            }
+        }
+    }
 
     /// Build a unified filter set. Pass `synthetic=true` to include
     /// `ClientFilter::Synthetic` as a set member (the new way to express
@@ -1135,19 +1265,79 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_from_a_different_parser_generation_misses() {
+        // The point of the field. A parser fix changes the totals without
+        // changing the file layout, the group_by, the scope or the client set,
+        // so every other check here passes and the pre-fix numbers get handed
+        // back. Same payload as the fresh case, only the generation differs.
+        let mut value: serde_json::Value =
+            serde_json::from_str(&with_current_generation(LEGACY_FALLBACK_PAYLOAD)).unwrap();
+        value["parserGeneration"] =
+            serde_json::json!(tokscale_core::parser_generation().wrapping_add(1));
+
+        let payload: CachedTUIData = serde_json::from_value(value).unwrap();
+        let clients = make_filters(&[ClientFilter::Claude], false);
+        let result = classify_cached_payload(
+            payload,
+            &clients,
+            &GroupBy::Model,
+            &CacheReportScope::default(),
+        );
+        assert!(
+            matches!(result, CacheResult::Miss),
+            "a stale parser generation must Miss, not Stale -- Stale is painted just like Fresh; got {}",
+            other_variant_name(&result)
+        );
+    }
+
+    #[test]
+    fn a_cache_written_before_the_generation_field_misses() {
+        // Migration path. Files written before the field existed deserialize to
+        // 0, which no real generation equals, so they rebuild once on their own
+        // -- no schema bump needed to evict them.
+        let payload: CachedTUIData = serde_json::from_str(LEGACY_FALLBACK_PAYLOAD).unwrap();
+        assert_eq!(payload.parser_generation, 0, "pre-field files default to 0");
+
+        let clients = make_filters(&[ClientFilter::Claude], false);
+        let result = classify_cached_payload(
+            payload,
+            &clients,
+            &GroupBy::Model,
+            &CacheReportScope::default(),
+        );
+        assert!(
+            matches!(result, CacheResult::Miss),
+            "a cache predating the field must rebuild; got {}",
+            other_variant_name(&result)
+        );
+    }
+
+    #[test]
+    fn parser_generation_is_stable_and_non_zero() {
+        // The value is persisted, so it must not vary between calls. This
+        // deliberately does not pin a literal: that would need editing on every
+        // parser bump, which is the maintenance burden the field removes.
+        assert_eq!(
+            tokscale_core::parser_generation(),
+            tokscale_core::parser_generation()
+        );
+        // 0 is the serde default for pre-field files, so a real generation must
+        // never collide with it.
+        assert_ne!(tokscale_core::parser_generation(), 0);
+    }
+
+    #[test]
     #[serial]
     fn load_cache_misses_when_report_scope_differs() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let cache_path = cache_file().unwrap();
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(
             &cache_path,
-            r#"{
+            with_current_generation(
+                r#"{
   "schemaVersion": 10,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
@@ -1170,6 +1360,7 @@ mod tests {
     "longestStreak": 0
   }
 }"#,
+            ),
         )
         .unwrap();
 
@@ -1189,23 +1380,13 @@ mod tests {
             load_cache(&clients, &GroupBy::Model, &filtered_scope),
             CacheResult::Fresh(_)
         ));
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     #[test]
     #[serial]
     fn save_cached_data_writes_report_scope() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        let previous_override = env::var_os("TOKSCALE_CONFIG_DIR");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-            env::remove_var("TOKSCALE_CONFIG_DIR");
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let clients = make_filters(&[ClientFilter::Claude], false);
         let scope = CacheReportScope::new(
@@ -1227,31 +1408,20 @@ mod tests {
             load_cache(&clients, &GroupBy::Model, &CacheReportScope::default()),
             CacheResult::Miss
         ));
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
-        match previous_override {
-            Some(value) => unsafe { env::set_var("TOKSCALE_CONFIG_DIR", value) },
-            None => unsafe { env::remove_var("TOKSCALE_CONFIG_DIR") },
-        }
     }
 
     #[test]
     #[serial]
     fn old_cache_without_report_scope_is_stale_for_unfiltered_scope() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let cache_path = cache_file().unwrap();
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(
             &cache_path,
-            r#"{
+            with_current_generation(
+                r#"{
   "schemaVersion": 8,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
@@ -1269,6 +1439,7 @@ mod tests {
     "longestStreak": 0
   }
 }"#,
+            ),
         )
         .unwrap();
 
@@ -1283,27 +1454,20 @@ mod tests {
             load_cache(&clients, &GroupBy::Model, &filtered_scope),
             CacheResult::Miss
         ));
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     #[test]
     #[serial]
     fn test_load_cache_misses_for_legacy_schema_without_group_by() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let cache_path = cache_file().unwrap();
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(
             &cache_path,
-            r#"{
+            with_current_generation(
+                r#"{
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
   "includeSynthetic": false,
@@ -1317,6 +1481,7 @@ mod tests {
     "longestStreak": 0
   }
 }"#,
+            ),
         )
         .unwrap();
 
@@ -1325,27 +1490,20 @@ mod tests {
             load_cache(&clients, &GroupBy::Model, &CacheReportScope::default()),
             CacheResult::Miss
         ));
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     #[test]
     #[serial]
     fn test_load_cache_misses_when_group_by_differs() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let cache_path = cache_file().unwrap();
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(
             &cache_path,
-            r#"{
+            with_current_generation(
+                r#"{
   "schemaVersion": 4,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
@@ -1361,6 +1519,7 @@ mod tests {
     "longestStreak": 0
   }
 }"#,
+            ),
         )
         .unwrap();
 
@@ -1373,27 +1532,20 @@ mod tests {
             ),
             CacheResult::Miss
         ));
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     #[test]
     #[serial]
     fn test_load_cache_stale_legacy_daily_models_without_display_fields() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let cache_path = cache_file().unwrap();
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(
             &cache_path,
-            r#"{
+            with_current_generation(
+                r#"{
   "schemaVersion": 3,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
@@ -1434,6 +1586,7 @@ mod tests {
     "longestStreak": 1
   }
 }"#,
+            ),
         )
         .unwrap();
 
@@ -1450,27 +1603,20 @@ mod tests {
                 other_variant_name(&other)
             ),
         }
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     #[test]
     #[serial]
     fn test_load_cache_reads_source_breakdown_from_current_schema() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let cache_path = cache_file().unwrap();
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(
             &cache_path,
-            r#"{
+            with_current_generation(
+                r#"{
   "schemaVersion": 10,
   "timestamp": 9999999999999,
   "enabledClients": ["claude", "cursor"],
@@ -1554,6 +1700,7 @@ mod tests {
     "longestStreak": 1
   }
 }"#,
+            ),
         )
         .unwrap();
 
@@ -1571,27 +1718,20 @@ mod tests {
                 other_variant_name(&other)
             ),
         }
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     #[test]
     #[serial]
     fn test_load_cache_stale_legacy_hourly_models_without_display_fields() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let cache_path = cache_file().unwrap();
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(
             &cache_path,
-            r#"{
+            with_current_generation(
+                r#"{
   "schemaVersion": 5,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
@@ -1635,6 +1775,7 @@ mod tests {
     "longestStreak": 1
   }
 }"#,
+            ),
         )
         .unwrap();
 
@@ -1647,27 +1788,20 @@ mod tests {
             }
             other => panic!("expected cache data, got {:?}", other_variant_name(&other)),
         }
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     #[test]
     #[serial]
     fn test_load_cache_legacy_empty_client_falls_back_to_unknown() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let cache_path = cache_file().unwrap();
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(
             &cache_path,
-            r#"{
+            with_current_generation(
+                r#"{
   "schemaVersion": 3,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
@@ -1708,6 +1842,7 @@ mod tests {
     "longestStreak": 1
   }
 }"#,
+            ),
         )
         .unwrap();
 
@@ -1728,31 +1863,9 @@ mod tests {
                 other_variant_name(&other)
             ),
         }
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
-    #[test]
-    #[serial]
-    fn load_cache_falls_back_to_legacy_dot_cache_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        let previous_override = env::var_os("TOKSCALE_CONFIG_DIR");
-        let previous_xdg_config_home = env::var_os("XDG_CONFIG_HOME");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-            env::remove_var("TOKSCALE_CONFIG_DIR");
-            env::set_var("XDG_CONFIG_HOME", temp_dir.path().join(".xdg-config"));
-        }
-
-        let legacy_path = temp_dir.path().join(".cache/tokscale/tui-data-cache.json");
-        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        fs::write(
-            &legacy_path,
-            r#"{
+    const LEGACY_FALLBACK_PAYLOAD: &str = r#"{
   "schemaVersion": 10,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
@@ -1769,28 +1882,86 @@ mod tests {
     "currentStreak": 0,
     "longestStreak": 0
   }
-}"#,
-        )
-        .unwrap();
+}"#;
+
+    /// The canonical cache path and the legacy `~/.cache/tokscale` path are
+    /// asserted separately on purpose.
+    ///
+    /// Driving this contract through `load_cache` was order-dependent on
+    /// Windows and flaked in CI (run 31772032073). `HOME` moves
+    /// `legacy_dot_cache_tokscale_dir()` on every platform, but it does not
+    /// move `get_config_dir()` on Windows, where it resolves through
+    /// `dirs::config_dir()` (`%APPDATA%`) and no environment variable can
+    /// redirect it. Every sibling test that writes `cache_file()` therefore
+    /// wrote the same real `%APPDATA%\tokscale\cache\tui-data-cache.json`,
+    /// and this test only reached the legacy probe when it happened to run
+    /// before all of them: `load_cache` reads a legacy file only when the
+    /// canonical one is `NotFound`. That precedence is correct and stays
+    /// unchanged — the test was the broken part.
+    #[test]
+    fn read_cached_payload_reads_legacy_only_when_canonical_is_absent() {
+        let temp_dir = TempDir::new().unwrap();
+        let canonical = temp_dir.path().join("canonical/tui-data-cache.json");
+        let legacy = temp_dir.path().join(".cache/tokscale/tui-data-cache.json");
+        fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, with_current_generation(LEGACY_FALLBACK_PAYLOAD)).unwrap();
 
         let clients = make_filters(&[ClientFilter::Claude], false);
-        assert!(matches!(
-            load_cache(&clients, &GroupBy::Model, &CacheReportScope::default()),
-            CacheResult::Fresh(_)
-        ));
+        let scope = CacheReportScope::default();
 
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
+        let fallback = read_cached_payload(&canonical, std::slice::from_ref(&legacy))
+            .expect("legacy file must be read when the canonical file is absent");
+        let result = classify_cached_payload(fallback, &clients, &GroupBy::Model, &scope);
+        assert!(
+            matches!(result, CacheResult::Fresh(_)),
+            "legacy fallback must classify as Fresh, got {}",
+            other_variant_name(&result)
+        );
+
+        // Canonical present: the legacy file must not be consulted at all,
+        // even though it is the newer/valid one here.
+        fs::write(
+            &canonical,
+            LEGACY_FALLBACK_PAYLOAD
+                .replace(r#""groupBy": "model""#, r#""groupBy": "client,model""#),
+        )
+        .unwrap();
+        let preferred = read_cached_payload(&canonical, std::slice::from_ref(&legacy))
+            .expect("canonical file must be read when present");
+        assert_eq!(preferred.group_by.as_deref(), Some("client,model"));
+
+        // Canonical present but unparseable is a miss, not a legacy read:
+        // falling back would resurrect data the canonical write superseded.
+        fs::write(&canonical, "{ not json").unwrap();
+        assert!(read_cached_payload(&canonical, std::slice::from_ref(&legacy)).is_none());
+    }
+
+    /// Pins the other half of the fallback: the legacy candidate list itself.
+    /// `home_dir()` honors `$HOME` on Windows too (#997), so this assertion is
+    /// deterministic on every platform.
+    #[test]
+    #[serial]
+    fn legacy_cache_files_resolve_under_home_and_vanish_when_overridden() {
+        let temp_dir = TempDir::new().unwrap();
+        let _env = CacheEnv::capture();
+        unsafe {
+            env::set_var("HOME", temp_dir.path());
+            env::remove_var("TOKSCALE_CONFIG_DIR");
         }
-        match previous_override {
-            Some(value) => unsafe { env::set_var("TOKSCALE_CONFIG_DIR", value) },
-            None => unsafe { env::remove_var("TOKSCALE_CONFIG_DIR") },
+
+        assert_eq!(
+            legacy_cache_files(),
+            vec![temp_dir.path().join(".cache/tokscale/tui-data-cache.json")]
+        );
+
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", temp_dir.path().join("explicit"));
         }
-        match previous_xdg_config_home {
-            Some(value) => unsafe { env::set_var("XDG_CONFIG_HOME", value) },
-            None => unsafe { env::remove_var("XDG_CONFIG_HOME") },
-        }
+        assert!(
+            legacy_cache_files().is_empty(),
+            "an explicit config dir must stay hermetic"
+        );
     }
 
     #[test]
@@ -1798,8 +1969,7 @@ mod tests {
     fn load_cache_skips_legacy_when_overridden() {
         let temp_dir = TempDir::new().unwrap();
         let override_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        let previous_override = env::var_os("TOKSCALE_CONFIG_DIR");
+        let _env = CacheEnv::capture();
         unsafe {
             env::set_var("HOME", temp_dir.path());
             env::set_var("TOKSCALE_CONFIG_DIR", override_dir.path());
@@ -1835,27 +2005,13 @@ mod tests {
             load_cache(&clients, &GroupBy::Model, &CacheReportScope::default()),
             CacheResult::Miss
         ));
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
-        match previous_override {
-            Some(value) => unsafe { env::set_var("TOKSCALE_CONFIG_DIR", value) },
-            None => unsafe { env::remove_var("TOKSCALE_CONFIG_DIR") },
-        }
     }
 
     #[test]
     #[serial]
     fn save_cached_data_does_not_delete_destination() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        let previous_override = env::var_os("TOKSCALE_CONFIG_DIR");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-            env::remove_var("TOKSCALE_CONFIG_DIR");
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let cache_path = cache_file().unwrap();
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
@@ -1901,15 +2057,6 @@ mod tests {
         assert!(metadata.is_file());
         let saved: CachedTUIData = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
         assert!(saved.timestamp >= old_timestamp);
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
-        match previous_override {
-            Some(value) => unsafe { env::set_var("TOKSCALE_CONFIG_DIR", value) },
-            None => unsafe { env::remove_var("TOKSCALE_CONFIG_DIR") },
-        }
     }
 
     fn other_variant_name(result: &CacheResult) -> &'static str {
@@ -1944,12 +2091,7 @@ mod tests {
     #[serial]
     fn warm_cache_round_trip_under_canonical_key_is_fresh() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        let previous_override = env::var_os("TOKSCALE_CONFIG_DIR");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-            env::remove_var("TOKSCALE_CONFIG_DIR");
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let enabled = ClientFilter::default_set();
         let scope = CacheReportScope::default();
@@ -1973,15 +2115,6 @@ mod tests {
             "expected Fresh after writing with TUI_DEFAULT_GROUP_BY, got {}",
             other_variant_name(&result)
         );
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
-        match previous_override {
-            Some(value) => unsafe { env::set_var("TOKSCALE_CONFIG_DIR", value) },
-            None => unsafe { env::remove_var("TOKSCALE_CONFIG_DIR") },
-        }
     }
 
     /// Documents the historical bug as a frozen regression: writing with
@@ -1993,12 +2126,7 @@ mod tests {
     #[serial]
     fn pre_fix_writer_key_misses_under_canonical_reader_key() {
         let temp_dir = TempDir::new().unwrap();
-        let previous_home = env::var_os("HOME");
-        let previous_override = env::var_os("TOKSCALE_CONFIG_DIR");
-        unsafe {
-            env::set_var("HOME", temp_dir.path());
-            env::remove_var("TOKSCALE_CONFIG_DIR");
-        }
+        let _env = CacheEnv::redirect(temp_dir.path());
 
         let enabled = ClientFilter::default_set();
         let scope = CacheReportScope::default();
@@ -2018,14 +2146,5 @@ mod tests {
             "expected Miss when reader uses TUI_DEFAULT_GROUP_BY and writer used GroupBy::default(), got {}",
             other_variant_name(&result)
         );
-
-        match previous_home {
-            Some(home) => unsafe { env::set_var("HOME", home) },
-            None => unsafe { env::remove_var("HOME") },
-        }
-        match previous_override {
-            Some(value) => unsafe { env::set_var("TOKSCALE_CONFIG_DIR", value) },
-            None => unsafe { env::remove_var("TOKSCALE_CONFIG_DIR") },
-        }
     }
 }

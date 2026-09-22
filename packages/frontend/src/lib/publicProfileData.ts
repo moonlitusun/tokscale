@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { unstable_cache } from "next/cache";
 import { db, users, submissions, dailyBreakdown } from "@/lib/db";
-import { eq, desc, sql, and, gte, lte } from "drizzle-orm";
+import { eq, desc, sql, and, gte } from "drizzle-orm";
 import {
   AmbiguousUsernameError,
   USERNAME_LOOKUP_LIMIT,
@@ -10,6 +10,7 @@ import {
   usernameEqualsIgnoreCase,
 } from "@/lib/db/usernameLookup";
 import { buildSubmissionFreshness } from "@/lib/submissionFreshness";
+import { calculateIntensity } from "@/lib/utils";
 
 const LEGACY_CLIENT_ALIASES: Record<string, string> = { kilocode: "kilo" };
 function normalizeClientId(id: string): string {
@@ -30,23 +31,57 @@ function toUtcDateString(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
+function getUtcToday(now: Date): Date {
+  return new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+  );
+}
+
 function parseProfilePeriod(value: string | null): ProfilePeriod {
   return PROFILE_PERIODS.includes(value as ProfilePeriod)
     ? (value as ProfilePeriod)
     : "all";
 }
 
+const DATE_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/** `YYYY-MM-DD` to its UTC midnight; null for anything that is not one. */
+function parseDateKey(value: string | null | undefined): Date | null {
+  if (!value || !DATE_KEY_PATTERN.test(value)) return null;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/**
+ * The day every profile window ends on: the later of UTC today and the newest
+ * date the data itself carries.
+ *
+ * Contribution dates are calendar-day buckets computed by the CLI in the
+ * *submitting* machine's local timezone, so a user ahead of UTC legitimately
+ * reports a date that is still tomorrow here. Anchoring to the data keeps that
+ * day inside every window for every viewer, wherever they are, and keeps the
+ * range-scoped stats on the same window the chart draws. Validation caps
+ * contribution dates at UTC today + 2 days, so the anchor can never run more
+ * than two days past the present.
+ */
+function getProfileRangeAnchor(
+  latestDate: string | null | undefined,
+  now: Date,
+): Date {
+  const utcToday = getUtcToday(now);
+  const latest = parseDateKey(latestDate);
+  return latest && latest > utcToday ? latest : utcToday;
+}
+
+/** Trailing seven- or thirty-day window ending on `end`; null for lifetime. */
 function getProfilePeriodDateRange(
   period: ProfilePeriod,
-  now: Date = new Date(),
+  end: Date,
 ): ProfilePeriodDateRange | null {
   if (period === "all") {
     return null;
   }
 
-  const end = new Date(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-  );
   const start = new Date(end);
   start.setUTCDate(start.getUTCDate() - (period === "week" ? 6 : 29));
 
@@ -56,12 +91,8 @@ function getProfilePeriodDateRange(
   };
 }
 
-function getRollingProfileDateRange(
-  now: Date = new Date(),
-): ProfilePeriodDateRange {
-  const end = new Date(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-  );
+/** Rolling twelve-month window for the lifetime chart, ending on `end`. */
+function getRollingProfileDateRange(end: Date): ProfilePeriodDateRange {
   const targetYear = end.getUTCFullYear() - 1;
   const month = end.getUTCMonth();
   const lastValidDay = new Date(
@@ -101,8 +132,18 @@ export async function getPublicProfileResponse(
     const { username } = await params;
     const { searchParams } = new URL(request.url);
     const period = parseProfilePeriod(searchParams.get("period"));
-    const periodRange = getProfilePeriodDateRange(period);
-    const chartRange = periodRange ?? getRollingProfileDateRange();
+    // One clock reading for the whole request, so a UTC midnight crossed
+    // mid-request cannot put the query and the window on different days.
+    const now = new Date();
+    // The window a period request draws ends on the anchor, which is only known
+    // once the stats query returns. The anchor can only move *forward* of UTC
+    // today, so a window measured back from UTC today starts on or before the
+    // real one — fetching from there is a superset that `scopedContributions`
+    // trims to the anchored window.
+    const periodFetchStart = getProfilePeriodDateRange(
+      period,
+      getUtcToday(now),
+    )?.start;
 
     // Find user
     const matchingUsers = await db
@@ -130,11 +171,14 @@ export async function getPublicProfileResponse(
       return NextResponse.redirect(canonicalUrl, 308);
     }
 
-    const dailyBreakdownFilter = periodRange
+    // Deliberately unbounded above: `submissions.dateEnd` is
+    // `MAX(dailyBreakdown.date)`, so the anchor already dominates every row this
+    // user has and an upper bound could only ever drop the newest day of an
+    // owner whose calendar runs ahead of UTC.
+    const dailyBreakdownFilter = periodFetchStart
       ? and(
           eq(submissions.userId, user.id),
-          gte(dailyBreakdown.date, periodRange.start),
-          lte(dailyBreakdown.date, periodRange.end),
+          gte(dailyBreakdown.date, periodFetchStart),
         )
       : eq(submissions.userId, user.id);
 
@@ -152,6 +196,16 @@ export async function getPublicProfileResponse(
             submissionCount: sql<number>`COALESCE(MAX(${submissions.submitCount}), 0)`,
             earliestDate: sql<string>`MIN(${submissions.dateStart})`,
             latestDate: sql<string>`MAX(${submissions.dateEnd})`,
+            // `submissions` is unique per user, so this SUM reads a single row.
+            // That row's sessionCount is itself derived in the submit route by
+            // summing PER-DEVICE counts, which is what makes the "all-time"
+            // label defensible for multi-device users -- before that it was one
+            // device's snapshot overwriting another's.
+            //
+            // Still an approximate historical maximum, not an exact count: each
+            // device's stored value is a high-water mark, so a submit filtered
+            // by --clients/--date can never lower it, and a re-sessionization
+            // that legitimately merges two intervals cannot correct it down.
             sessionCount: sql<number>`COALESCE(SUM(${submissions.sessionCount}), 0)`,
           })
           .from(submissions)
@@ -165,28 +219,39 @@ export async function getPublicProfileResponse(
             cliVersion: submissions.cliVersion,
             schemaVersion: submissions.schemaVersion,
             mcpServers: submissions.mcpServers,
+            hasBackfill: submissions.hasBackfill,
           })
           .from(submissions)
           .where(eq(submissions.userId, user.id))
           .orderBy(desc(submissions.updatedAt))
           .limit(1),
 
-        db.execute<{ rank: number }>(sql`
-        WITH user_totals AS (
-          SELECT
-            user_id,
-            SUM(total_tokens) as total_tokens
-          FROM submissions
-          GROUP BY user_id
-        ),
-        ranked AS (
-          SELECT
-            user_id,
-            RANK() OVER (ORDER BY total_tokens DESC) as rank
-          FROM user_totals
-        )
-        SELECT rank FROM ranked WHERE user_id = ${user.id}
-      `),
+        // A finite rank needs the anchored profile range, which is only known
+        // after the stats query returns the newest submitted date. Keep the
+        // lifetime rank concurrent and defer only finite-period ranking.
+        //
+        // Shared RANK here on purpose: the leaderboard's all-time tab ranks
+        // the same way, so tied users read the same number on both surfaces.
+        period === "all"
+          ? db.execute<{ rank: number }>(sql`
+              WITH user_totals AS (
+                SELECT
+                  s.user_id,
+                  SUM(s.total_tokens) as total_tokens
+                FROM submissions s
+                JOIN users u ON u.id = s.user_id
+                WHERE u.leaderboard_hidden = false
+                GROUP BY s.user_id
+              ),
+              ranked AS (
+                SELECT
+                  user_id,
+                  RANK() OVER (ORDER BY total_tokens DESC) as rank
+                FROM user_totals
+              )
+              SELECT rank FROM ranked WHERE user_id = ${user.id}
+            `)
+          : Promise.resolve([]),
 
         db
           .select({
@@ -209,7 +274,78 @@ export async function getPublicProfileResponse(
 
     const [stats] = statsResult;
     const [latestSubmission] = latestSubmissionResult;
-    const rank = (rankResult as unknown as { rank: number }[])[0]?.rank || null;
+    // Resolved only once the newest submitted date is known, so every window —
+    // lifetime and period alike — ends on the data instead of on UTC "today".
+    const rangeAnchor = getProfileRangeAnchor(stats?.latestDate, now);
+    const periodRange = getProfilePeriodDateRange(period, rangeAnchor);
+    const chartRange = periodRange ?? getRollingProfileDateRange(rangeAnchor);
+    // Ranks over rankable users only. A hidden user is absent from the CTE
+    // entirely, so this returns no row and the profile reports rank null. The
+    // finite query uses the exact same anchored window as the visible profile
+    // totals and chart.
+    //
+    // The two windows deliberately differ, because the two leaderboard tabs
+    // they have to agree with do: the finite query mirrors the leaderboard's
+    // period path (sequential ROW_NUMBER with the same tie-breakers, so tied
+    // users get distinct positions in the same order), and the lifetime query
+    // mirrors the all-time path (shared RANK, so tied users share a position).
+    //
+    // The scan ranks every rankable user's daily rows, so it is cached for a
+    // minute per user and window instead of running on every request. A user
+    // with no daily rows in the window has no row in the CTE either, so the
+    // scan is skipped outright and the rank reported null directly.
+    const hasPeriodRows =
+      periodRange !== null &&
+      dailyData.some(
+        (day) => day.date >= periodRange.start && day.date <= periodRange.end,
+      );
+    const scopedRankResult = periodRange
+      ? hasPeriodRows
+        ? await unstable_cache(
+            () =>
+              db.execute<{ rank: number }>(sql`
+                WITH user_totals AS (
+                  SELECT
+                    s.user_id,
+                    u.username,
+                    SUM(d.tokens) as total_tokens,
+                    SUM(CAST(d.cost AS DECIMAL(18,4))) as total_cost
+                  FROM daily_breakdown d
+                  INNER JOIN submissions s ON d.submission_id = s.id
+                  INNER JOIN users u ON u.id = s.user_id
+                  WHERE u.leaderboard_hidden = false
+                    AND d.date >= ${periodRange.start}
+                    AND d.date <= ${periodRange.end}
+                  GROUP BY s.user_id, u.username
+                ),
+                ranked AS (
+                  SELECT
+                    user_id,
+                    ROW_NUMBER() OVER (ORDER BY total_tokens DESC, total_cost DESC, LOWER(username) ASC, user_id ASC) as rank
+                  FROM user_totals
+                )
+                SELECT rank FROM ranked WHERE user_id = ${user.id}
+              `),
+            [
+              "profile-period-rank",
+              user.id,
+              periodRange.start,
+              periodRange.end,
+            ],
+            {
+              revalidate: 60,
+              tags: [
+                "leaderboard",
+                `user:${normalizeUsernameCacheKey(user.username)}`,
+              ],
+            },
+          )()
+        : []
+      : rankResult;
+    const rank =
+      Number(
+        (scopedRankResult as unknown as { rank: number }[])[0]?.rank,
+      ) || null;
 
     type ModelData = {
       tokens: number;
@@ -233,6 +369,26 @@ export async function getPublicProfileResponse(
       messages: number;
       models?: Record<string, ModelData>;
       modelId?: string;
+    };
+
+    /**
+     * Every merge below accumulates in place, so whatever an accumulator holds
+     * it will eventually rewrite. `breakdown.models` belongs to a `dailyData`
+     * row, so adopting it by reference makes the accumulator and the row the
+     * same object and the next row's merge silently rewrites the row that
+     * seeded it. Copy the map and its entries at the boundary so the
+     * accumulator only ever mutates memory it owns.
+     */
+    const cloneClientModels = (
+      models: Record<string, ModelData> | undefined,
+    ) => {
+      if (!models) return undefined;
+
+      const copy: Record<string, ModelData> = {};
+      for (const [modelId, model] of Object.entries(models)) {
+        copy[modelId] = { ...model };
+      }
+      return copy;
     };
 
     const mergeClientModel = (
@@ -340,7 +496,7 @@ export async function getPublicProfileResponse(
                 cacheWrite: breakdown.cacheWrite || 0,
                 reasoning: breakdown.reasoning || 0,
                 messages: breakdown.messages || 0,
-                models: breakdown.models,
+                models: cloneClientModels(breakdown.models),
                 modelId: breakdown.modelId,
               };
             }
@@ -403,7 +559,7 @@ export async function getPublicProfileResponse(
                 cacheWrite: breakdown.cacheWrite || 0,
                 reasoning: breakdown.reasoning || 0,
                 messages: breakdown.messages || 0,
-                models: breakdown.models,
+                models: cloneClientModels(breakdown.models),
                 modelId: breakdown.modelId,
               };
             }
@@ -449,12 +605,27 @@ export async function getPublicProfileResponse(
       }
     }
 
-    // Calculate max cost for intensity
+    // Calculate max tokens for intensity. Tokens, not cost, because every
+    // embed already shades from tokens -- layoutContributions in
+    // lib/embed/embedShared.ts, getUserEmbedStats and renderIsometric3DSvg all
+    // recompute intensity from totalTokens -- so a cost-scaled profile graph
+    // shaded the same account differently from its own embeds, and a day whose
+    // client reports no pricing read as blank.
     const contributions = Array.from(aggregatedDaily.values());
     const scopedContributions = contributions.filter(
       ({ date }) => date >= chartRange.start && date <= chartRange.end,
     );
-    const maxCost = Math.max(...contributions.map((c) => c.cost), 0);
+    // A lifetime request ships every day it holds — the graph's year dropdown
+    // reads them. A period request ships only its window: the query fetches a
+    // day or two more than the anchored window draws, and neither the intensity
+    // scale nor the graph may see past the window's edge.
+    const visibleContributions = periodRange
+      ? scopedContributions
+      : contributions;
+    const maxTokens = Math.max(
+      ...visibleContributions.map((c) => c.tokens),
+      0,
+    );
     const periodTotals = scopedContributions.reduce(
       (totals, day) => {
         totals.totalTokens += day.tokens;
@@ -482,19 +653,8 @@ export async function getPublicProfileResponse(
     );
 
     // Build contribution graph data
-    const graphContributions = contributions.map((day) => {
-      const intensity =
-        maxCost === 0
-          ? 0
-          : day.cost === 0
-            ? 0
-            : day.cost <= maxCost * 0.25
-              ? 1
-              : day.cost <= maxCost * 0.5
-                ? 2
-                : day.cost <= maxCost * 0.75
-                  ? 3
-                  : 4;
+    const graphContributions = visibleContributions.map((day) => {
+      const intensity = calculateIntensity(day.tokens, maxTokens);
 
       let dayCacheRead = 0;
       let dayCacheWrite = 0;
@@ -577,7 +737,7 @@ export async function getPublicProfileResponse(
         displayName: user.displayName,
         avatarUrl: user.avatarUrl,
         createdAt: user.createdAt,
-        rank: isPeriodFiltered ? null : rank ? Number(rank) : null,
+        rank,
       },
       stats: {
         totalTokens: isPeriodFiltered
@@ -625,6 +785,9 @@ export async function getPublicProfileResponse(
         ? periodModels
         : latestSubmission?.modelsUsed || [],
       mcpServers: latestSubmission?.mcpServers || [],
+      // Sticky per-user flag: true once any accepted submission carried a
+      // backfill provenance tag (badge-only; ranking is unaffected).
+      hasBackfill: latestSubmission?.hasBackfill ?? false,
       modelUsage,
       contributions: graphContributions,
     });

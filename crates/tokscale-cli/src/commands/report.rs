@@ -13,7 +13,9 @@ use tokscale_core::content_extractor::SessionContent;
 use tokscale_core::content_extractor::{extract_session_content, metadata_only_content};
 use tokscale_core::pricing::PricingService;
 use tokscale_core::wiki::{WikiDb, WikiEntry};
-use tokscale_core::{parse_local_clients, LocalParseOptions, ParsedMessage, TokenBreakdown};
+use tokscale_core::{
+    parse_local_clients, CostSource, LocalParseOptions, ParsedMessage, TokenBreakdown,
+};
 
 pub struct ReportOptions {
     pub json: bool,
@@ -39,7 +41,12 @@ pub fn run_report(opts: ReportOptions) -> Result<()> {
 
     populate_wiki_from_sessions(&db, &opts)?;
 
-    let (since_ts, until_ts) = parse_date_range(&opts.since, &opts.until);
+    // Day boundaries have to be resolved in the same zone the day keys are built
+    // from, or a pinned device filters pinned-day strings against host-day
+    // instants and loses an offset's worth of sessions at each edge.
+    let bucket_timezone =
+        tokscale_core::BucketTimezone::from_scanner_settings(&opts.scanner_settings);
+    let (since_ts, until_ts) = parse_date_range(&opts.since, &opts.until, &bucket_timezone);
 
     if opts.rebuild {
         let count = db
@@ -102,10 +109,6 @@ pub fn run_report(opts: ReportOptions) -> Result<()> {
 }
 
 fn populate_wiki_from_sessions(db: &WikiDb, opts: &ReportOptions) -> Result<()> {
-    let existing = db
-        .get_existing_session_ids()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
     let parsed = parse_local_clients(LocalParseOptions {
         home_dir: opts.home_dir.clone(),
         use_env_roots: opts.home_dir.is_none(),
@@ -119,9 +122,24 @@ fn populate_wiki_from_sessions(db: &WikiDb, opts: &ReportOptions) -> Result<()> 
 
     let pricing = load_pricing_service();
 
+    record_new_sessions(db, &parsed.messages, pricing.as_deref())
+}
+
+/// Aggregate `messages` per session and record every session the wiki has not
+/// seen yet. Recorded sessions are never rewritten, so the figures computed
+/// here are the ones the wiki keeps.
+fn record_new_sessions(
+    db: &WikiDb,
+    messages: &[ParsedMessage],
+    pricing: Option<&PricingService>,
+) -> Result<()> {
+    let existing = db
+        .get_existing_session_ids()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     let mut session_map: HashMap<String, SessionAgg> = HashMap::new();
 
-    for msg in &parsed.messages {
+    for msg in messages {
         let agg = session_map
             .entry(msg.session_id.clone())
             .or_insert_with(|| SessionAgg {
@@ -145,7 +163,7 @@ fn populate_wiki_from_sessions(db: &WikiDb, opts: &ReportOptions) -> Result<()> 
         agg.total_input = agg.total_input.saturating_add(msg.input);
         agg.total_output = agg.total_output.saturating_add(msg.output);
         agg.total_cache_read = agg.total_cache_read.saturating_add(msg.cache_read);
-        agg.total_cost += compute_msg_cost(msg, pricing.as_deref());
+        agg.total_cost += compute_msg_cost(msg, pricing);
         // NOTE: the wiki `report` view intentionally groups on the raw model_id
         // and does not apply `modelAliases` folding (nor the grouping
         // normalization every other report uses). Wiki entries are persisted
@@ -271,9 +289,10 @@ fn run_summarizer(
         let results = match backend {
             "apple-fm" => run_apple_fm_summarizer(chunk)?,
             "claude" | "codex" | "gemini" | "kiro" => run_cli_summarizer(backend, chunk)?,
+            "minimax" => run_minimax_summarizer(chunk)?,
             other => {
                 return Err(anyhow::anyhow!(
-                    "Unknown summarizer backend: '{}'. Valid options: apple-fm, claude, codex, gemini, kiro",
+                    "Unknown summarizer backend: '{}'. Valid options: apple-fm, claude, codex, gemini, kiro, minimax",
                     other
                 ));
             }
@@ -344,8 +363,9 @@ fn run_task_grouping(db: &WikiDb, entries: &[WikiEntry], backend: &str) -> Resul
         return Ok(());
     }
 
-    // Non-CLI backends (apple-fm and any future on-device backend) have no LLM
-    // grouping path. Rather than skip — which leaves every task_group null and
+    // Non-CLI backends (apple-fm and any backend without a local grouping CLI,
+    // such as minimax) have no LLM grouping path here. Rather than skip — which
+    // leaves every task_group null and
     // makes the report collapse sessions by EXACT title — cluster titles
     // deterministically in Rust. This merges near-duplicate titles ("Enhance API
     // Security" / "Enhance API security with JWT auth middleware") into a single
@@ -897,6 +917,119 @@ fn run_cli_summarizer(
     }
 }
 
+/// Default MiniMax text model used by the `minimax` summarizer backend. Callers
+/// may override it with the `MINIMAX_MODEL` environment variable (for example to
+/// select the smaller `MiniMax-M2.7` model).
+const MINIMAX_DEFAULT_MODEL: &str = "MiniMax-M3";
+
+/// Global (international) OpenAI-compatible base URL for MiniMax inference.
+const MINIMAX_GLOBAL_BASE_URL: &str = "https://api.minimax.io/v1";
+
+/// Mainland-China OpenAI-compatible base URL for MiniMax inference. Selected by
+/// setting `MINIMAX_API_REGION` to `cn` (aliases: `cn_zh`, `china`, `zh`).
+const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
+
+/// Resolve the MiniMax OpenAI-compatible base URL for a region string. Defaults
+/// to the global endpoint; any China alias selects the CN endpoint.
+fn minimax_base_url(region: Option<&str>) -> &'static str {
+    match region.map(|r| r.trim().to_ascii_lowercase()).as_deref() {
+        Some("cn") | Some("cn_zh") | Some("china") | Some("zh") => MINIMAX_CN_BASE_URL,
+        _ => MINIMAX_GLOBAL_BASE_URL,
+    }
+}
+
+/// Extract the assistant message text from an OpenAI-compatible chat-completion
+/// response body (`choices[0].message.content`).
+fn parse_openai_content(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get("choices")?
+        .get(0)?
+        .get("message")?
+        .get("content")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Call the MiniMax OpenAI-compatible chat-completions endpoint with a single
+/// system + user turn and return the assistant text.
+///
+/// The API key is read from `MINIMAX_API_KEY` (falling back to
+/// `MINIMAX_API_TOKEN`), matching the usage-tracking module. `MINIMAX_API_REGION`
+/// picks the global or CN base URL, and `MINIMAX_MODEL` overrides the default
+/// model. Runs on a current-thread Tokio runtime so it fits the otherwise
+/// synchronous summarizer pipeline (`main` is not `#[tokio::main]`).
+fn minimax_chat(system_prompt: &str, user_prompt: &str) -> Result<String> {
+    let api_key = std::env::var("MINIMAX_API_KEY")
+        .or_else(|_| std::env::var("MINIMAX_API_TOKEN"))
+        .map_err(|_| anyhow::anyhow!("No MINIMAX_API_KEY or MINIMAX_API_TOKEN set."))?;
+    let region = std::env::var("MINIMAX_API_REGION").ok();
+    let base_url = minimax_base_url(region.as_deref());
+    let model =
+        std::env::var("MINIMAX_MODEL").unwrap_or_else(|_| MINIMAX_DEFAULT_MODEL.to_string());
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let client = tokscale_core::http::client_builder()
+            .timeout(BACKEND_TIMEOUT)
+            .build()?;
+        let body = serde_json::json!({
+            "model": model,
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt },
+            ],
+        });
+        let resp = client
+            .post(format!("{base_url}/chat/completions"))
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            anyhow::bail!("MiniMax rejected the API key (HTTP {status}).");
+        }
+        if !status.is_success() {
+            anyhow::bail!("MiniMax request failed (HTTP {status}).");
+        }
+
+        let text = resp.text().await?;
+        parse_openai_content(&text)
+            .ok_or_else(|| anyhow::anyhow!("MiniMax response missing choices[0].message.content"))
+    })
+}
+
+/// Summarizer backend that classifies sessions with a MiniMax text model over
+/// the OpenAI-compatible chat-completions endpoint. Mirrors
+/// [`run_cli_summarizer`]: any failure (missing key, network error, unparseable
+/// response) is logged and degrades to an empty batch so the report continues.
+fn run_minimax_summarizer(payloads: &[serde_json::Value]) -> Result<Vec<serde_json::Value>> {
+    let prompt = build_cli_prompt(payloads);
+
+    let content = match minimax_chat(SUMMARIZER_SYSTEM_PROMPT, &prompt) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("  {} minimax summarizer failed: {}", "⚠".yellow(), e);
+            return Ok(Vec::new());
+        }
+    };
+
+    let json_str = extract_json_array(&content);
+    match serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+        Ok(results) => Ok(results),
+        Err(e) => {
+            eprintln!("  {} Failed to parse minimax response: {}", "⚠".yellow(), e);
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// Upper bound on how long any LLM summarizer subprocess may run before we
 /// kill it. Deliberately generous (5 min) so legitimate batched LLM calls
 /// never trip it, but it bounds a true hang (auth prompt, network stall) so
@@ -1279,10 +1412,16 @@ impl SessionPathIndex {
 /// the id from the in-file `sessionId`/`session_id` field, so they are keyed by
 /// the parsed id (with the stem kept as a fallback alias).
 fn build_session_path_index(opts: &ReportOptions) -> SessionPathIndex {
+    // Same contract as `tokscale_core::get_home_dir_string`: only
+    // `paths::home_dir` may read `$HOME`, so a Git Bash `HOME=/home/user` on
+    // Windows cannot send this scan to `C:\home\user`. `unwrap_or_default()`
+    // is retained as the last resort because indexing is best-effort, but it
+    // is now only reachable when no home resolves at all rather than whenever
+    // `HOME` was exported blank.
     let home_dir = opts
         .home_dir
         .clone()
-        .or_else(|| std::env::var("HOME").ok())
+        .or_else(|| tokscale_core::paths::home_dir().map(|p| p.to_string_lossy().into_owned()))
         .unwrap_or_default();
     let use_env_roots = opts.home_dir.is_none();
 
@@ -1340,46 +1479,63 @@ fn extract_content_for_session(
     extract_session_content(&entry.client, &entry.session_id, &candidates)
 }
 
-fn parse_date_range(since: &Option<String>, until: &Option<String>) -> (Option<i64>, Option<i64>) {
-    // The `since`/`until` strings are local-calendar dates (e.g. produced by
-    // `build_date_filter`, which derives them from `chrono::Local::now()`), and
-    // session dates are bucketed in local time (see
-    // `sessions::timestamp_to_date`). Interpret the day boundaries in local time
-    // so filtering lines up with grouping and avoids off-by-a-day mismatches.
+fn parse_date_range(
+    since: &Option<String>,
+    until: &Option<String>,
+    bucket_timezone: &tokscale_core::BucketTimezone,
+) -> (Option<i64>, Option<i64>) {
+    // The `since`/`until` strings are calendar dates in the scan's bucketing
+    // zone (e.g. produced by `build_date_filter`), and session dates are keyed
+    // in that same zone. Interpret the day boundaries there too, so filtering
+    // lines up with grouping and avoids off-by-a-day mismatches. With nothing
+    // pinned this resolves through `chrono::Local`, exactly as before.
     let since_ts = since
         .as_ref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .and_then(local_start_of_day_millis);
+        .and_then(|d| start_of_day_millis(d, bucket_timezone));
     let until_ts = until
         .as_ref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
         .and_then(|d| d.succ_opt())
-        .and_then(|next| local_start_of_day_millis(next).map(|ms| ms - 1));
+        .and_then(|next| start_of_day_millis(next, bucket_timezone).map(|ms| ms - 1));
     (since_ts, until_ts)
 }
 
-/// Returns the Unix-millisecond timestamp for the start of `date` in the local
-/// timezone.
+/// Returns the Unix-millisecond timestamp for the start of `date` in the scan's
+/// bucketing timezone.
 ///
 /// This is normally midnight (00:00:00), but in zones that spring forward at
 /// local midnight (e.g. `America/Nuuk` on `2024-03-31`) that wall-clock time
 /// does not exist. Rather than dropping the boundary (which would silently make
 /// date filtering unbounded), we walk forward to the first representable instant
 /// after the gap so the day boundary is preserved.
-fn local_start_of_day_millis(date: chrono::NaiveDate) -> Option<i64> {
-    start_of_day_millis_with(date, |wall| Local.from_local_datetime(wall))
+fn start_of_day_millis(
+    date: chrono::NaiveDate,
+    bucket_timezone: &tokscale_core::BucketTimezone,
+) -> Option<i64> {
+    use chrono::TimeZone;
+
+    match bucket_timezone {
+        tokscale_core::BucketTimezone::Local => {
+            start_of_day_millis_with(date, |wall| Local.from_local_datetime(wall))
+        }
+        tokscale_core::BucketTimezone::Pinned(tz) => {
+            start_of_day_millis_with(date, |wall| tz.from_local_datetime(wall))
+        }
+    }
 }
 
-/// Core of [`local_start_of_day_millis`], parameterized over the timezone
+/// Core of [`start_of_day_millis`], parameterized over the timezone
 /// resolver so the DST-gap handling can be exercised deterministically in tests.
 ///
 /// Starts at midnight and, when that wall-clock time is skipped (a spring-forward
 /// gap), walks forward in 1-minute steps to the first representable instant. The
 /// probe window covers a full day so even unusual offsets resolve rather than
 /// silently dropping the boundary.
-fn start_of_day_millis_with<F>(date: chrono::NaiveDate, resolve: F) -> Option<i64>
+fn start_of_day_millis_with<Tz, F>(date: chrono::NaiveDate, resolve: F) -> Option<i64>
 where
-    F: Fn(&chrono::NaiveDateTime) -> chrono::LocalResult<chrono::DateTime<Local>>,
+    Tz: chrono::TimeZone,
+    F: Fn(&chrono::NaiveDateTime) -> chrono::LocalResult<chrono::DateTime<Tz>>,
 {
     let mut wall = date.and_hms_opt(0, 0, 0)?;
     for _ in 0..=(24 * 60) {
@@ -1405,10 +1561,17 @@ fn load_pricing_service() -> Option<std::sync::Arc<PricingService>> {
     fresh.or_else(|| PricingService::load_cached_any_age().map(std::sync::Arc::new))
 }
 
-/// Computes a message's cost using the canonical [`PricingService`], honoring
+/// Computes a message's cost. A provider-reported cost is used as-is, the same
+/// way the submit lane never reprices an authoritative figure: some sources
+/// (fx session snapshots, for one) report a cost for a row that carries no
+/// tokens at all, and pricing that row from its tokens would record $0.00.
+/// Anything else is priced with the canonical [`PricingService`], honoring
 /// per-model rates and every billed token type (input/output/cache read/cache
 /// write/reasoning). Returns 0.0 when no pricing dataset is available.
 fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f64 {
+    if msg.cost_source == CostSource::ProviderReported {
+        return msg.cost;
+    }
     let Some(pricing) = pricing else {
         return 0.0;
     };
@@ -1488,6 +1651,8 @@ mod tests {
             duration_ms: None,
             message_count: 1,
             agent: None,
+            cost: 0.0,
+            cost_source: CostSource::Unknown,
         }
     }
 
@@ -1528,7 +1693,11 @@ mod tests {
         // each message (and how `build_date_filter` derives these strings from
         // `chrono::Local::now()`).
         let day = "2026-03-08";
-        let (since, until) = parse_date_range(&Some(day.into()), &Some(day.into()));
+        let (since, until) = parse_date_range(
+            &Some(day.into()),
+            &Some(day.into()),
+            &tokscale_core::BucketTimezone::Local,
+        );
 
         let expected_since = Local
             .with_ymd_and_hms(2026, 3, 8, 0, 0, 0)
@@ -1629,6 +1798,84 @@ mod tests {
     fn compute_msg_cost_without_pricing_is_zero() {
         let msg = parsed_message("claude-haiku-4");
         assert_eq!(compute_msg_cost(&msg, None), 0.0);
+    }
+
+    #[test]
+    fn compute_msg_cost_keeps_a_provider_reported_cost() {
+        let pricing = test_pricing_service();
+        let mut msg = parsed_message("claude-haiku-4");
+        let estimated = compute_msg_cost(&msg, Some(&pricing));
+        assert!(estimated > 0.0);
+
+        msg.cost = 0.42;
+        msg.cost_source = CostSource::ProviderReported;
+        assert_eq!(compute_msg_cost(&msg, Some(&pricing)), 0.42);
+        // An authoritative figure does not need a pricing dataset at all.
+        assert_eq!(compute_msg_cost(&msg, None), 0.42);
+
+        // A parser-side cost that is not authoritative never overrides the
+        // canonical pricing of the tokens.
+        msg.cost_source = CostSource::Estimated;
+        assert_eq!(compute_msg_cost(&msg, Some(&pricing)), estimated);
+    }
+
+    #[test]
+    fn wiki_keeps_the_reported_cost_of_a_token_free_fx_session() {
+        // fx can snapshot a session with a positive `total_cost`, no per-model
+        // entries and zero tokens; the parser attributes it to `fx-unknown`
+        // with the reported cost. Pricing that row from its tokens yields $0,
+        // and the wiki never rewrites a session it has already recorded, so
+        // the wrong figure would stick for good.
+        let home = tempfile::TempDir::new().unwrap();
+        let session = home.path().join(".fx/sessions/sess-1");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("session.json"),
+            r#"{"workspace_root":"/Users/alice/repo","updated_at_ms":1780000000000}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("usage-v2.json"),
+            r#"{"schema_version":1,"session_id":"sess-1","snapshot":{"schema_version":2,"total_cost":0.014,"request_count":1,"models":[]}}"#,
+        )
+        .unwrap();
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["fx".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: Default::default(),
+        })
+        .unwrap();
+        let fx: Vec<&ParsedMessage> = parsed
+            .messages
+            .iter()
+            .filter(|msg| msg.client == "fx")
+            .collect();
+        assert_eq!(fx.len(), 1, "one fx-unknown row expected");
+        assert_eq!(
+            fx[0].input + fx[0].output + fx[0].cache_read + fx[0].cache_write + fx[0].reasoning,
+            0,
+            "the fixture must carry no tokens for the cost to come from the snapshot"
+        );
+
+        let db = WikiDb::open(&home.path().join("wiki.db")).unwrap();
+        record_new_sessions(&db, &parsed.messages, None).unwrap();
+
+        let entry = db
+            .get_entry("sess-1")
+            .unwrap()
+            .expect("the fx session must be recorded");
+        assert_eq!(entry.client, "fx");
+        assert_eq!(entry.models_used, vec!["fx-unknown".to_string()]);
+        assert!(
+            (entry.total_cost - 0.014).abs() < 1e-9,
+            "wiki must keep the provider-reported cost, got {}",
+            entry.total_cost
+        );
     }
 
     fn titled_entry(session_id: &str, title: &str) -> WikiEntry {
@@ -2098,5 +2345,46 @@ mod tests {
         let entry = entry_for(inner_id, "gemini");
         let content = extract_content_for_session(&entry, &index);
         assert_eq!(content.first_user_message.as_deref(), Some("Hello Gemini"));
+    }
+
+    #[test]
+    fn minimax_base_url_defaults_to_global() {
+        assert_eq!(minimax_base_url(None), "https://api.minimax.io/v1");
+        assert_eq!(
+            minimax_base_url(Some("global")),
+            "https://api.minimax.io/v1"
+        );
+        assert_eq!(
+            minimax_base_url(Some("global_en")),
+            "https://api.minimax.io/v1"
+        );
+    }
+
+    #[test]
+    fn minimax_base_url_selects_cn_region() {
+        assert_eq!(minimax_base_url(Some("cn")), "https://api.minimaxi.com/v1");
+        assert_eq!(
+            minimax_base_url(Some(" CN_ZH ")),
+            "https://api.minimaxi.com/v1"
+        );
+        assert_eq!(
+            minimax_base_url(Some("china")),
+            "https://api.minimaxi.com/v1"
+        );
+    }
+
+    #[test]
+    fn parse_openai_content_extracts_assistant_message() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"[{\"session_id\":\"s1\"}]"}}]}"#;
+        assert_eq!(
+            parse_openai_content(body).as_deref(),
+            Some("[{\"session_id\":\"s1\"}]")
+        );
+    }
+
+    #[test]
+    fn parse_openai_content_returns_none_without_choices() {
+        assert_eq!(parse_openai_content(r#"{"error":"nope"}"#), None);
+        assert_eq!(parse_openai_content("not json"), None);
     }
 }

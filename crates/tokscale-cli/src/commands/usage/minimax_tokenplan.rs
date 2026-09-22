@@ -159,7 +159,7 @@ pub fn fetch_all() -> Result<Vec<UsageOutput>> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let client = reqwest::Client::new();
+        let client = tokscale_core::http::client();
         let mut outputs = Vec::new();
 
         for site in targets {
@@ -202,6 +202,7 @@ pub fn fetch_all() -> Result<Vec<UsageOutput>> {
                     label: Some(site.label.to_string()),
                     is_active: true,
                 }),
+                credential_source: None,
                 plan: None,
                 email: None,
                 metrics,

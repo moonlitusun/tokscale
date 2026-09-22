@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use tokscale_core::scanner::ScannerSettings;
 
 use super::themes::ThemeName;
@@ -19,6 +22,116 @@ const MAX_NATIVE_TIMEOUT_MS: u64 = 3_600_000;
 pub const DEFAULT_AUTOSUBMIT_INTERVAL_MINUTES: u64 = 24 * 60;
 pub const MIN_AUTOSUBMIT_INTERVAL_MINUTES: u64 = 15;
 pub const MAX_AUTOSUBMIT_INTERVAL_MINUTES: u64 = 7 * 24 * 60;
+
+/// An opaque snapshot of the settings files read by
+/// [`Settings::load_with_origin`].
+///
+/// Saving requires complete settings and checks the source files immediately
+/// before replacement. Tokscale writers coordinate through a sibling lock;
+/// external editors that ignore it can still race the final check and rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsOrigin {
+    primary_path: Option<PathBuf>,
+    primary_snapshot: SettingsFileSnapshot,
+    legacy_snapshot: Option<(PathBuf, SettingsFileSnapshot)>,
+    safe_to_overwrite: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SettingsFileSnapshot {
+    Missing,
+    Present(String),
+    Unreadable,
+}
+
+impl SettingsOrigin {
+    fn from_raw(
+        primary_path: Option<PathBuf>,
+        primary: &RawSettings,
+        legacy: Option<(&Path, &RawSettings)>,
+    ) -> Self {
+        Self {
+            primary_path,
+            primary_snapshot: SettingsFileSnapshot::from_raw(primary),
+            legacy_snapshot: legacy
+                .map(|(path, raw)| (path.to_path_buf(), SettingsFileSnapshot::from_raw(raw))),
+            safe_to_overwrite: false,
+        }
+    }
+
+    fn writable(mut self) -> Self {
+        self.safe_to_overwrite = true;
+        self
+    }
+
+    /// Whether the settings loaded with this origin are complete enough to save.
+    ///
+    /// False when loading produced defaults rather than complete settings,
+    /// where saving would overwrite settings we could not read.
+    pub fn is_safe_to_overwrite(&self) -> bool {
+        self.safe_to_overwrite
+    }
+
+    fn settings_json(&self) -> Result<BTreeMap<String, Box<RawValue>>> {
+        if !self.is_safe_to_overwrite() {
+            bail!("could not read this machine's tokscale settings, so refusing to replace them");
+        }
+        let snapshot = match &self.primary_snapshot {
+            SettingsFileSnapshot::Missing => self
+                .legacy_snapshot
+                .as_ref()
+                .map(|(_, snapshot)| snapshot)
+                .unwrap_or(&self.primary_snapshot),
+            snapshot => snapshot,
+        };
+        match snapshot {
+            SettingsFileSnapshot::Present(content) => Ok(serde_json::from_str(content)?),
+            SettingsFileSnapshot::Missing => Ok(BTreeMap::new()),
+            SettingsFileSnapshot::Unreadable => {
+                bail!(
+                    "could not read this machine's tokscale settings, so refusing to replace them"
+                )
+            }
+        }
+    }
+
+    fn verify_unchanged(&self) -> Result<&Path> {
+        let path = self
+            .primary_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("could not resolve the tokscale settings location"))?;
+        if SettingsFileSnapshot::from_raw(&Settings::read_config_file(path))
+            != self.primary_snapshot
+        {
+            bail!("settings.json changed since it was loaded; refusing to replace it");
+        }
+        if let Some((legacy_path, legacy_snapshot)) = &self.legacy_snapshot {
+            if SettingsFileSnapshot::from_raw(&Settings::read_config_file(legacy_path))
+                != *legacy_snapshot
+            {
+                bail!("settings.json changed since it was loaded; refusing to replace it");
+            }
+        }
+        Ok(path)
+    }
+}
+
+impl SettingsFileSnapshot {
+    fn from_raw(raw: &RawSettings) -> Self {
+        match raw {
+            RawSettings::Missing => Self::Missing,
+            RawSettings::Present(content) => Self::Present(content.clone()),
+            RawSettings::Unreadable => Self::Unreadable,
+        }
+    }
+}
+
+/// The raw read of a settings file, before parsing.
+enum RawSettings {
+    Missing,
+    Present(String),
+    Unreadable,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum ExplicitHomeConfigLayout {
@@ -44,6 +157,20 @@ pub struct LightSettings {
     /// flags `--write-cache` / `--no-write-cache` override this per-invocation.
     #[serde(default)]
     pub write_cache: bool,
+}
+
+/// Subscription-usage providers hidden from both `tokscale usage` and the TUI.
+///
+/// Values are stable provider ids rather than display labels so a copy of the
+/// settings file continues to work when a provider's branding changes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSettings {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_disabled_providers_string_array_lossy"
+    )]
+    pub disabled_providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +199,18 @@ pub struct AutosubmitSettings {
     #[serde(default)]
     pub scheduler: Option<String>,
     #[serde(default)]
+    pub managed_executable: Option<String>,
+    /// Version of the build that `managed_executable` was copied from.
+    ///
+    /// The copy is written only by `autosubmit enable`, so upgrading the
+    /// installed binary leaves the scheduled job on the old build. Without this
+    /// there is no way to tell a stale scheduled job from a current one, and
+    /// the drift is silent. `None` on configs written before this field
+    /// existed, and on those the version is reported as unknown rather than
+    /// assumed current.
+    #[serde(default)]
+    pub managed_executable_version: Option<String>,
+    #[serde(default)]
     pub last_run_at_ms: Option<i64>,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -91,6 +230,8 @@ impl Default for AutosubmitSettings {
             week: false,
             month: false,
             scheduler: None,
+            managed_executable: None,
+            managed_executable_version: None,
             last_run_at_ms: None,
             last_error: None,
         }
@@ -142,6 +283,10 @@ pub struct Settings {
     pub default_clients: Vec<String>,
     #[serde(default)]
     pub light: LightSettings,
+    /// Subscription-usage providers to skip before credential discovery or
+    /// network access. Unknown ids are ignored by the usage provider registry.
+    #[serde(default)]
+    pub usage: UsageSettings,
     /// Opt-in toggle for the per-minute breakdown tab. Default is `false`
     /// to keep the tab strip focused on the daily/hourly views most users
     /// want and to skip the minute-bucket aggregation cost in DataLoader
@@ -161,6 +306,10 @@ pub struct Settings {
     /// existed loading cleanly; an absent or empty map means no folding.
     #[serde(default)]
     pub model_aliases: tokscale_core::ModelAliasMap,
+    /// When true, the interactive TUI uses a light background instead of the
+    /// hardcoded dark one. Toggled live with the `L` key and persisted.
+    #[serde(default)]
+    pub tui_light_mode: bool,
 }
 
 /// Lossy deserializer for `defaultClients`: accepts an array of arbitrary
@@ -179,6 +328,23 @@ where
         .into_iter()
         .flatten()
         .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect())
+}
+
+/// Lossy deserializer for `usage.disabledProviders`: individual non-string
+/// array members are ignored, but the field itself must be an array. A wrong
+/// top-level shape means the settings file could not be faithfully recovered,
+/// so callers that may save it must keep it untouched.
+fn deserialize_disabled_providers_string_array_lossy<'de, D>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| value.as_str().map(ToString::to_string))
         .collect())
 }
 
@@ -209,9 +375,11 @@ impl Default for Settings {
             scanner: ScannerSettings::default(),
             default_clients: Vec::new(),
             light: LightSettings::default(),
+            usage: UsageSettings::default(),
             minutely_tab_enabled: false,
             autosubmit: AutosubmitSettings::default(),
             model_aliases: tokscale_core::ModelAliasMap::default(),
+            tui_light_mode: false,
         }
     }
 }
@@ -229,6 +397,80 @@ pub fn load_scanner_settings() -> ScannerSettings {
 
 pub fn load_scanner_settings_for_home(home_dir: &Option<String>) -> ScannerSettings {
     Settings::load_for_home_override(home_dir.as_deref().map(Path::new)).scanner
+}
+
+/// Record this machine's IANA timezone as the device's bucketing zone, once.
+///
+/// Day keys used to be derived from `chrono::Local` on every scan, so moving
+/// machines or changing `TZ` re-split the same history across different days
+/// and the server's monotonic per-day guard turned that into permanent
+/// inflation. Pinning the zone removes the cause, but only for devices that
+/// actually have one pinned — so the CLI pins on first run rather than waiting
+/// for every user to discover a config command.
+///
+/// This is deliberately not a behaviour change on the machine that runs it: the
+/// zone written is the one `chrono::Local` would have resolved anyway, so the
+/// first scan after pinning reports exactly what it would have reported before.
+/// What changes is the *next* scan, from somewhere else.
+///
+/// Does nothing when:
+/// - a zone is already pinned — including one the user set by hand;
+/// - settings.json exists but could not be read. This is the one place in the
+///   CLI that loads settings and then unconditionally writes them back, and
+///   [`Settings::load`] answers a parse failure with `Settings::default()`. The
+///   two together would replace a hand-edited or truncated settings.json with
+///   defaults plus a timezone, destroying scanner paths, aliases, autosubmit
+///   config and UI preferences — on a plain `tokscale report`, with no prompt.
+///   A device that stays unpinned keeps a bug it already had; a device whose
+///   settings are erased cannot get them back.
+/// - the platform cannot name its zone (`TZ=+09:00`, a container with no
+///   zoneinfo). A fixed offset cannot follow DST, so pinning one would swap this
+///   bug for a smaller version of itself. Staying unpinned is the honest state.
+/// - the caller passed `--home`, which points at another machine's data
+///   directory. This machine's zone is not that device's zone, and `save()`
+///   writes to *this* machine's config path regardless, so the two would not
+///   even agree on a file.
+///
+/// A value that is present but does not name a zone the tz database knows — an
+/// empty string, a typo, a raw offset — is *not* treated as pinned, because
+/// bucketing does not treat it as pinned either: it degrades to host-local and
+/// the device keeps the exposure this function exists to close. Those are
+/// re-detected. Overwriting one is safe in a way that overwriting an unreadable
+/// file is not: the file parsed, so everything else in it survives the write,
+/// and the only value lost is one nothing could act on.
+///
+/// A failed save is ignored: the next run retries, and an unpinned device is
+/// exactly as correct as it was before this function existed.
+pub fn pin_bucket_timezone_if_unset(home_dir: &Option<String>) {
+    if home_dir.is_some() {
+        return;
+    }
+
+    let (mut settings, origin) = Settings::load_with_origin();
+    if !origin.is_safe_to_overwrite() {
+        tracing::warn!(
+            "settings.json could not be read — leaving it untouched rather than \
+             replacing it with defaults to record scanner.bucketTimezone"
+        );
+        return;
+    }
+
+    if tokscale_core::BucketTimezone::from_scanner_settings(&settings.scanner).is_pinned() {
+        return;
+    }
+
+    let Some(zone) = tokscale_core::bucket_tz::detect_local_iana_name() else {
+        tracing::debug!(
+            "could not resolve an IANA timezone name for this machine — \
+             leaving scanner.bucketTimezone unset"
+        );
+        return;
+    };
+
+    settings.scanner.bucket_timezone = Some(zone);
+    if let Err(error) = settings.save_with_origin(origin) {
+        tracing::debug!(%error, "failed to persist scanner.bucketTimezone");
+    }
 }
 
 /// Loads the user's configured model aliases, honoring a `--home` override the
@@ -307,9 +549,29 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        let primary = Self::config_path()
-            .ok()
-            .and_then(|path| fs::read_to_string(path).ok());
+        Self::load_with_origin().0
+    }
+
+    /// [`Settings::load`], plus where the returned value came from.
+    ///
+    /// `load()` answers "what settings should this run use", and defaults are
+    /// the right answer to that question however the read went. They are the
+    /// wrong answer to "what is safe to write back": a file that exists but
+    /// cannot be parsed still holds the user's scanner paths, aliases,
+    /// autosubmit config and UI preferences, and none of them are in the
+    /// defaults handed back. Anything that loads in order to save has to be
+    /// able to tell those two cases apart, so it can decline instead of
+    /// replacing data it never saw.
+    pub fn load_with_origin() -> (Self, SettingsOrigin) {
+        let (primary_path, primary) = match Self::config_path() {
+            Ok(path) => {
+                let raw = Self::read_config_file(&path);
+                (Some(path), raw)
+            }
+            // Cannot even resolve where settings live. Not "absent": a save
+            // would fail the same way, so do not report this as writable.
+            Err(_) => (None, RawSettings::Unreadable),
+        };
 
         // Transparent macOS fallback: pre-fix releases wrote settings.json under
         // `~/Library/Application Support/tokscale/`. Read it once if the new
@@ -319,16 +581,65 @@ impl Settings {
         // has explicitly pinned a config root via `TOKSCALE_CONFIG_DIR` so
         // CI sandboxes and isolated profiles stay hermetic instead of
         // silently ingesting personal settings from the legacy macOS path.
-        let raw = primary.or_else(|| {
-            if crate::paths::is_config_dir_overridden() {
-                return None;
-            }
-            Self::legacy_macos_path().and_then(|legacy| fs::read_to_string(legacy).ok())
-        });
+        //
+        // The fallback is attempted whenever the primary is not readable, not
+        // only when it is missing — that is what it did before this function
+        // reported an origin, and narrowing it would lose the legacy file to a
+        // permissions error on the new path.
+        let legacy_path = match primary {
+            RawSettings::Present(_) => None,
+            _ if crate::paths::is_config_dir_overridden() => None,
+            _ => Self::legacy_macos_path(),
+        };
+        let legacy = legacy_path.as_deref().map(Self::read_config_file);
 
-        raw.and_then(|content| serde_json::from_str(&content).ok())
-            .map(Settings::normalize)
-            .unwrap_or_default()
+        // Snapshot the primary rather than the selected `raw`: a valid legacy
+        // macOS fallback is deliberately saved to a still-missing primary path.
+        let origin = SettingsOrigin::from_raw(
+            primary_path,
+            &primary,
+            legacy_path.as_deref().zip(legacy.as_ref()),
+        );
+
+        // `save()` writes to the primary path whatever was read, so an
+        // unreadable primary stays unreadable even when the legacy file
+        // supplies the values: a write would still land on top of the file we
+        // could not see.
+        let primary_was_unreadable = matches!(primary, RawSettings::Unreadable);
+
+        let raw = match (primary, legacy) {
+            (RawSettings::Present(content), _) => RawSettings::Present(content),
+            (_, Some(RawSettings::Present(content))) => RawSettings::Present(content),
+            // A legacy file we could not *open* outranks a missing primary.
+            // (Legacy content that fails to parse is already `Present` here and
+            // is caught below.) It holds settings the user can still repair,
+            // and writing a primary would shadow it permanently: the fallback
+            // only fires while the primary is absent, so the repaired legacy
+            // file would never be read again.
+            (_, Some(RawSettings::Unreadable)) => RawSettings::Unreadable,
+            (primary, _) => primary,
+        };
+
+        match raw {
+            RawSettings::Missing => (Self::default(), origin.writable()),
+            RawSettings::Unreadable => (Self::default(), origin),
+            RawSettings::Present(content) => match serde_json::from_str::<Settings>(&content) {
+                Ok(settings) if primary_was_unreadable => (settings.normalize(), origin),
+                Ok(settings) => (settings.normalize(), origin.writable()),
+                Err(_) => (Self::default(), origin),
+            },
+        }
+    }
+
+    /// Read a settings file, keeping "there is no file" distinct from "there is
+    /// a file and we could not read it". `read_to_string(..).ok()` collapses
+    /// the two, and the difference is the whole point here.
+    fn read_config_file(path: &Path) -> RawSettings {
+        match fs::read_to_string(path) {
+            Ok(content) => RawSettings::Present(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => RawSettings::Missing,
+            Err(_) => RawSettings::Unreadable,
+        }
     }
 
     pub fn load_for_home_override(home_dir: Option<&Path>) -> Self {
@@ -345,9 +656,52 @@ impl Settings {
             .unwrap_or_default()
     }
 
+    /// Replace the complete settings file with this value.
+    ///
+    /// This cannot detect edits made before this call. Long-lived callers
+    /// changing individual fields should use [`Self::update_and_save`].
     pub fn save(&self) -> Result<()> {
-        let path = Self::config_path()?;
-        let content = serde_json::to_string_pretty(self)?;
+        self.save_with_origin(Self::load_with_origin().1)
+    }
+
+    /// Validate the latest settings, then replace one top-level preference.
+    /// Unmodified values retain their original JSON, including number precision.
+    pub(crate) fn update_and_save(field: &str, value: impl Serialize) -> Result<()> {
+        let (_, origin) = Self::load_with_origin();
+        let mut settings = origin.settings_json()?;
+        settings.insert(field.to_string(), serde_json::value::to_raw_value(&value)?);
+        Self::save_json_with_origin(&settings, origin)
+    }
+
+    /// Save settings using the origin returned when those settings were loaded.
+    ///
+    /// Keep the settings and origin from the same load together. Callers
+    /// updating individual fields without an origin should use
+    /// [`Self::update_and_save`] to preserve unrelated edits.
+    pub(crate) fn save_with_origin(&self, origin: SettingsOrigin) -> Result<()> {
+        Self::save_json_with_origin(self, origin)
+    }
+
+    fn save_json_with_origin(settings: &impl Serialize, origin: SettingsOrigin) -> Result<()> {
+        if !origin.is_safe_to_overwrite() {
+            bail!("could not read this machine's tokscale settings, so refusing to replace them");
+        }
+
+        let path = origin
+            .primary_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("could not resolve the tokscale settings location"))?;
+        // Coordinate Tokscale writers across the final comparison and rename.
+        // A non-cooperating editor can still race an atomic rename, but any edit
+        // present at this final check is rejected rather than overwritten.
+        let lock_path = path.with_file_name(".settings.lock");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)?;
+        lock.lock_exclusive()?;
+        let content = serde_json::to_string_pretty(settings)?;
 
         // Atomic write: write to temp file, sync, then rename
         // Matches the pattern used in tui/cache.rs and pricing/cache.rs
@@ -366,7 +720,10 @@ impl Settings {
             use std::io::Write;
             file.write_all(content.as_bytes())?;
             file.sync_all()?;
-            tokscale_core::fs_atomic::replace_file(&temp_path, &path)?;
+            // Check after staging and syncing: edits made during those slower
+            // operations must leave the destination untouched as well.
+            origin.verify_unchanged()?;
+            tokscale_core::fs_atomic::replace_file(&temp_path, path)?;
             Ok(())
         })();
 
@@ -409,6 +766,72 @@ impl Settings {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saving_patched_json_rejects_edits_since_load() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("settings.json");
+        fs::write(&path, r#"{"colorPalette":"blue"}"#).unwrap();
+        let origin =
+            SettingsOrigin::from_raw(Some(path.clone()), &Settings::read_config_file(&path), None)
+                .writable();
+        let mut settings = origin.settings_json().unwrap();
+        settings.insert(
+            "tuiLightMode".into(),
+            serde_json::value::to_raw_value(&true).unwrap(),
+        );
+        let replacement = r#"{"usage":{"disabledProviders":["copilot"]}}"#;
+        fs::write(&path, replacement).unwrap();
+
+        let error = Settings::save_json_with_origin(&settings, origin).unwrap_err();
+
+        assert!(error.to_string().contains("changed since it was loaded"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), replacement);
+    }
+
+    #[test]
+    fn settings_json_preserves_unknown_legacy_members() {
+        let legacy = RawSettings::Present(
+            r#"{"colorPalette":"green","future":{"nested":true}}"#.to_string(),
+        );
+        let origin = SettingsOrigin::from_raw(
+            Some(PathBuf::from("settings.json")),
+            &RawSettings::Missing,
+            Some((Path::new("legacy/settings.json"), &legacy)),
+        )
+        .writable();
+
+        assert_eq!(
+            serde_json::to_value(origin.settings_json().unwrap()).unwrap(),
+            serde_json::json!({"colorPalette": "green", "future": {"nested": true}})
+        );
+    }
 
     #[test]
     fn explicit_home_config_path_uses_unix_dot_config_layout() {
@@ -821,5 +1244,179 @@ mod tests {
             round_trip["minutelyTabEnabled"],
             serde_json::Value::Bool(true)
         );
+    }
+
+    #[test]
+    fn usage_disabled_providers_defaults_for_legacy_settings() {
+        let parsed: Settings = serde_json::from_str(r#"{"colorPalette":"blue"}"#).unwrap();
+        assert!(parsed.usage.disabled_providers.is_empty());
+    }
+
+    #[test]
+    fn usage_disabled_providers_rejects_a_non_array_field() {
+        for invalid in ["null", "true", "42", r#"{"copilot":true}"#, r#""copilot""#] {
+            let json = format!(r#"{{"usage":{{"disabledProviders":{invalid}}}}}"#);
+            assert!(
+                serde_json::from_str::<Settings>(&json).is_err(),
+                "disabledProviders must reject {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_disabled_providers_keeps_valid_string_entries() {
+        let parsed: Settings = serde_json::from_str(
+            r#"{"usage":{"disabledProviders":["copilot", null, 42, " CODEX "]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.usage.disabled_providers, ["copilot", " CODEX "]);
+
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            serialized["usage"]["disabledProviders"],
+            serde_json::json!(["copilot", " CODEX "])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_with_origin_marks_invalid_disabled_providers_as_unreadable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+        let path = temp.path().join("settings.json");
+        let malformed = r#"{"usage":{"disabledProviders":{"copilot":true}}}"#;
+        fs::write(&path, malformed).unwrap();
+
+        let (settings, origin) = Settings::load_with_origin();
+        assert!(!origin.is_safe_to_overwrite());
+        assert_eq!(settings.color_palette, Settings::default().color_palette);
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_refuses_to_replace_unreadable_settings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+        let path = temp.path().join("settings.json");
+        let malformed = r#"{"usage":{"disabledProviders":{"copilot":true}}}"#;
+        fs::write(&path, malformed).unwrap();
+
+        let save_error = Settings::load().save().unwrap_err();
+        assert!(save_error.to_string().contains("refusing to replace them"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_with_origin_refuses_to_replace_unreadable_settings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+        let path = temp.path().join("settings.json");
+        let malformed = r#"{"usage":{"disabledProviders":{"copilot":true}}}"#;
+        fs::write(&path, malformed).unwrap();
+
+        let (settings, origin) = Settings::load_with_origin();
+        let save_error = settings.save_with_origin(origin).unwrap_err();
+        assert!(save_error.to_string().contains("refusing to replace them"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_initializes_missing_settings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+        let settings = Settings {
+            color_palette: "green".to_string(),
+            ..Settings::default()
+        };
+        settings.save().unwrap();
+
+        let saved: Settings =
+            serde_json::from_str(&fs::read_to_string(temp.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.color_palette, "green");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_with_origin_initializes_missing_settings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+        let (_, origin) = Settings::load_with_origin();
+        let settings = Settings {
+            color_palette: "green".to_string(),
+            ..Settings::default()
+        };
+        settings.save_with_origin(origin).unwrap();
+
+        let saved: Settings =
+            serde_json::from_str(&fs::read_to_string(temp.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.color_palette, "green");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_with_origin_refuses_to_replace_settings_changed_after_load() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+        let path = temp.path().join("settings.json");
+        fs::write(&path, r#"{"colorPalette":"blue"}"#).unwrap();
+        let (settings, origin) = Settings::load_with_origin();
+
+        let replacement = r#"{"colorPalette":"halloween"}"#;
+        fs::write(&path, replacement).unwrap();
+
+        let save_error = settings.save_with_origin(origin).unwrap_err();
+        assert!(save_error
+            .to_string()
+            .contains("changed since it was loaded"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), replacement);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_with_origin_refuses_to_replace_malformed_settings_created_after_load() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+        let (settings, origin) = Settings::load_with_origin();
+        let path = temp.path().join("settings.json");
+        let malformed = r#"{"usage":{"disabledProviders":{"copilot":true}}}"#;
+        fs::write(&path, malformed).unwrap();
+
+        let save_error = settings.save_with_origin(origin).unwrap_err();
+        assert!(save_error
+            .to_string()
+            .contains("changed since it was loaded"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_with_origin_refuses_to_replace_settings_made_malformed_after_load() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+        let path = temp.path().join("settings.json");
+        fs::write(&path, r#"{"colorPalette":"blue"}"#).unwrap();
+        let (settings, origin) = Settings::load_with_origin();
+
+        let malformed = r#"{"usage":{"disabledProviders":{"copilot":true}}}"#;
+        fs::write(&path, malformed).unwrap();
+
+        let save_error = settings.save_with_origin(origin).unwrap_err();
+        assert!(save_error
+            .to_string()
+            .contains("changed since it was loaded"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
     }
 }

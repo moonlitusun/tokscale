@@ -6,8 +6,14 @@ import {
   normalizeUsernameCacheKey,
   usernameEqualsIgnoreCase,
 } from "@/lib/db/usernameLookup";
-import { eq, sql, and, gte } from "drizzle-orm";
-import { getContributionIntensity, getContributionWindow } from "./embedShared";
+import { eq, sql, and, gte, lte } from "drizzle-orm";
+import {
+  getContributionIntensity,
+  getContributionWindow,
+  getEmbedPeriodDateRange,
+  type EmbedPeriod,
+  type EmbedPeriodDateRange,
+} from "./embedShared";
 
 export type EmbedSortBy = "tokens" | "cost";
 
@@ -19,6 +25,8 @@ export interface EmbedContributionDay {
 }
 
 export interface UserEmbedStats {
+  period: EmbedPeriod;
+  dateRange: EmbedPeriodDateRange | null;
   user: {
     id: string;
     username: string;
@@ -33,12 +41,15 @@ export interface UserEmbedStats {
     /** Total number of ranked users, for rendering "rank N of total". */
     rankTotal?: number | null;
     updatedAt: string | null;
+    /** True once any accepted submission carried a backfill provenance tag. */
+    hasBackfill: boolean;
   };
 }
 
 async function fetchUserEmbedStats(
   username: string,
   sortBy: EmbedSortBy,
+  period: EmbedPeriod,
 ): Promise<UserEmbedStats | null> {
   const matchingUsers = await db
     .select({
@@ -49,7 +60,9 @@ async function fetchUserEmbedStats(
       totalTokens: sql<number>`COALESCE(${submissions.totalTokens}, 0)`,
       totalCost: sql<number>`COALESCE(CAST(${submissions.totalCost} AS DECIMAL(18,4)), 0)`,
       submissionCount: sql<number>`COALESCE(${submissions.submitCount}, 0)`,
+      latestDate: submissions.dateEnd,
       updatedAt: submissions.updatedAt,
+      hasBackfill: sql<boolean>`COALESCE(${submissions.hasBackfill}, false)`,
     })
     .from(users)
     .leftJoin(submissions, eq(submissions.userId, users.id))
@@ -63,39 +76,110 @@ async function fetchUserEmbedStats(
 
   let rank: number | null = null;
   let rankTotal: number | null = null;
+  const dateRange = getEmbedPeriodDateRange(period, result.latestDate);
 
-  const rankingValue =
-    sortBy === "cost"
-      ? Number(result.totalCost) || 0
-      : Number(result.totalTokens) || 0;
+  let totalTokens = Number(result.totalTokens) || 0;
+  let totalCost = Number(result.totalCost) || 0;
+
+  if (dateRange) {
+    const periodResult = await db.execute<{
+      totalTokens: number;
+      totalCost: number;
+    }>(sql`
+      SELECT
+        COALESCE(SUM(d.tokens), 0) AS "totalTokens",
+        COALESCE(SUM(CAST(d.cost AS DECIMAL(18,4))), 0) AS "totalCost"
+      FROM daily_breakdown d
+      INNER JOIN submissions s ON d.submission_id = s.id
+      WHERE s.user_id = ${result.id}
+        AND d.date >= ${dateRange.start}
+        AND d.date <= ${dateRange.end}
+    `);
+    const periodRow = periodResult[0];
+    totalTokens = Number(periodRow?.totalTokens) || 0;
+    totalCost = Number(periodRow?.totalCost) || 0;
+  }
+
+  const rankingValue = sortBy === "cost" ? totalCost : totalTokens;
 
   if (rankingValue > 0) {
-    const rankResult = await db.execute<{ rank: number; total: number }>(sql`
-      WITH ranked AS (
-        SELECT
-          user_id,
-          RANK() OVER (
-            ORDER BY
-              ${
-                sortBy === "cost"
-                  ? sql`CAST(total_cost AS DECIMAL(18,4)) DESC`
-                  : sql`total_tokens DESC`
-              }
-          ) AS rank
-        FROM submissions
-      )
-      SELECT rank, (SELECT COUNT(*)::int FROM submissions) AS total
-      FROM ranked WHERE user_id = ${result.id}
-    `);
+    // Both the rank and the "of N" denominator count rankable users only, so a
+    // hidden account neither holds a position nor inflates the total. A hidden
+    // user is absent from the CTE, so this returns no row and rank stays null.
+    //
+    // The finite window ranks the way the leaderboard's period tab does —
+    // sequential ROW_NUMBER with the same tie-breakers — so two users on the
+    // same total read the same distinct positions on both surfaces. The
+    // lifetime window keeps shared RANK to match the all-time tab.
+    const rankResult = dateRange
+      ? await db.execute<{ rank: number; total: number }>(sql`
+          WITH rankable AS (
+            SELECT
+              s.user_id,
+              u.username,
+              SUM(d.tokens) AS total_tokens,
+              SUM(CAST(d.cost AS DECIMAL(18,4))) AS total_cost
+            FROM daily_breakdown d
+            INNER JOIN submissions s ON d.submission_id = s.id
+            INNER JOIN users u ON u.id = s.user_id
+            WHERE u.leaderboard_hidden = false
+              AND d.date >= ${dateRange.start}
+              AND d.date <= ${dateRange.end}
+            GROUP BY s.user_id, u.username
+          ),
+          ranked AS (
+            SELECT
+              user_id,
+              ROW_NUMBER() OVER (
+                ORDER BY
+                  ${
+                    sortBy === "cost"
+                      ? sql`total_cost DESC, total_tokens DESC`
+                      : sql`total_tokens DESC, total_cost DESC`
+                  }, LOWER(username) ASC, user_id ASC
+              ) AS rank
+            FROM rankable
+          )
+          SELECT rank, (SELECT COUNT(*)::int FROM rankable) AS total
+          FROM ranked WHERE user_id = ${result.id}
+        `)
+      : await db.execute<{ rank: number; total: number }>(sql`
+          WITH rankable AS (
+            SELECT s.*
+            FROM submissions s
+            JOIN users u ON u.id = s.user_id
+            WHERE u.leaderboard_hidden = false
+          ),
+          ranked AS (
+            SELECT
+              user_id,
+              RANK() OVER (
+                ORDER BY
+                  ${
+                    sortBy === "cost"
+                      ? sql`CAST(total_cost AS DECIMAL(18,4)) DESC`
+                      : sql`total_tokens DESC`
+                  }
+              ) AS rank
+            FROM rankable
+          )
+          SELECT rank, (SELECT COUNT(*)::int FROM rankable) AS total
+          FROM ranked WHERE user_id = ${result.id}
+        `);
 
     const rankRow = (
       rankResult as unknown as { rank: number; total: number }[]
     )[0];
-    rank = rankRow?.rank || null;
-    rankTotal = rankRow?.total || null;
+    // Coerced because RANK()/ROW_NUMBER() are Postgres bigints, which
+    // postgres-js hands back as strings. Number(undefined) is NaN and falls
+    // through to null, so a missing row behaves as before.
+    rank = Number(rankRow?.rank) || null;
+    rankTotal = Number(rankRow?.total) || null;
   }
 
   return {
+    period,
+    dateRange,
     user: {
       id: result.id,
       username: result.username,
@@ -103,12 +187,13 @@ async function fetchUserEmbedStats(
       avatarUrl: result.avatarUrl,
     },
     stats: {
-      totalTokens: Number(result.totalTokens) || 0,
-      totalCost: Number(result.totalCost) || 0,
+      totalTokens,
+      totalCost,
       submissionCount: Number(result.submissionCount) || 0,
       rank,
       rankTotal,
       updatedAt: result.updatedAt?.toISOString() || null,
+      hasBackfill: Boolean(result.hasBackfill),
     },
   };
 }
@@ -116,17 +201,19 @@ async function fetchUserEmbedStats(
 export function getUserEmbedStats(
   username: string,
   sortBy: EmbedSortBy = "tokens",
+  period: EmbedPeriod = "all",
 ): Promise<UserEmbedStats | null> {
   const usernameCacheKey = normalizeUsernameCacheKey(username);
 
   return unstable_cache(
-    () => fetchUserEmbedStats(username, sortBy),
-    [`embed-user:${usernameCacheKey}:${sortBy}`],
+    () => fetchUserEmbedStats(username, sortBy, period),
+    [`embed-user:${usernameCacheKey}:${sortBy}:${period}`],
     {
       tags: [
         `user:${usernameCacheKey}`,
         `embed-user:${usernameCacheKey}`,
         `embed-user:${usernameCacheKey}:${sortBy}`,
+        `embed-user:${usernameCacheKey}:${sortBy}:${period}`,
       ],
       revalidate: 60,
     },
@@ -135,6 +222,7 @@ export function getUserEmbedStats(
 
 async function fetchUserEmbedContributions(
   username: string,
+  dateRange: EmbedPeriodDateRange | null,
 ): Promise<EmbedContributionDay[] | null> {
   const matchingUsers = await db
     .select({ id: users.id })
@@ -145,18 +233,31 @@ async function fetchUserEmbedContributions(
 
   if (!user) return null;
 
-  // Use UTC-based date and include a 7-day buffer before "one year ago"
-  // so that all dates visible in the first week of the contribution grid are included.
-  const today = new Date();
-  const cutoffDate = new Date(
-    Date.UTC(
-      today.getUTCFullYear() - 1,
-      today.getUTCMonth(),
-      today.getUTCDate(),
-    ),
-  );
-  cutoffDate.setUTCDate(cutoffDate.getUTCDate() - 7);
-  const cutoff = cutoffDate.toISOString().split("T")[0];
+  let cutoff: string;
+  if (dateRange) {
+    cutoff = dateRange.start;
+  } else {
+    // Use UTC-based date and include a 7-day buffer before "one year ago"
+    // so that all dates visible in the first week of the contribution grid are included.
+    const today = new Date();
+    const cutoffDate = new Date(
+      Date.UTC(
+        today.getUTCFullYear() - 1,
+        today.getUTCMonth(),
+        today.getUTCDate(),
+      ),
+    );
+    cutoffDate.setUTCDate(cutoffDate.getUTCDate() - 7);
+    cutoff = cutoffDate.toISOString().split("T")[0];
+  }
+
+  const contributionFilter = dateRange
+    ? and(
+        eq(submissions.userId, user.id),
+        gte(dailyBreakdown.date, dateRange.start),
+        lte(dailyBreakdown.date, dateRange.end),
+      )
+    : and(eq(submissions.userId, user.id), gte(dailyBreakdown.date, cutoff));
 
   const rows = await db
     .select({
@@ -166,9 +267,7 @@ async function fetchUserEmbedContributions(
     })
     .from(dailyBreakdown)
     .innerJoin(submissions, eq(dailyBreakdown.submissionId, submissions.id))
-    .where(
-      and(eq(submissions.userId, user.id), gte(dailyBreakdown.date, cutoff)),
-    )
+    .where(contributionFilter)
     .groupBy(dailyBreakdown.date)
     .orderBy(dailyBreakdown.date);
 
@@ -180,7 +279,13 @@ async function fetchUserEmbedContributions(
     totalCost: Number(row.cost) || 0,
     intensity: 0,
   }));
-  const contributionWindow = getContributionWindow(contributions);
+  const referenceDate = dateRange
+    ? new Date(`${dateRange.end}T00:00:00.000Z`)
+    : new Date();
+  const contributionWindow = getContributionWindow(
+    contributions,
+    referenceDate,
+  );
   const scopedDates = new Set(contributionWindow.days.map(({ date }) => date));
   const maxTokens = Math.max(
     0,
@@ -199,14 +304,22 @@ async function fetchUserEmbedContributions(
 
 export function getUserEmbedContributions(
   username: string,
+  dateRange: EmbedPeriodDateRange | null = null,
 ): Promise<EmbedContributionDay[] | null> {
   const usernameCacheKey = normalizeUsernameCacheKey(username);
+  const rangeKey = dateRange
+    ? `${dateRange.start}:${dateRange.end}`
+    : "all";
 
   return unstable_cache(
-    () => fetchUserEmbedContributions(username),
-    [`embed-contrib:${usernameCacheKey}`],
+    () => fetchUserEmbedContributions(username, dateRange),
+    [`embed-contrib:${usernameCacheKey}:${rangeKey}`],
     {
-      tags: [`user:${usernameCacheKey}`, `embed-contrib:${usernameCacheKey}`],
+      tags: [
+        `user:${usernameCacheKey}`,
+        `embed-contrib:${usernameCacheKey}`,
+        `embed-contrib:${usernameCacheKey}:${rangeKey}`,
+      ],
       revalidate: 60,
     },
   )();

@@ -1,4 +1,4 @@
-use super::{aliases, litellm::ModelPricing};
+use super::{aliases, litellm::ModelPricing, self_hosted};
 use crate::{provider_identity, strip_parenthesized_reasoning_tier, TokenBreakdown};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -44,19 +44,31 @@ const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
     "fireworks_ai/",
     "groq/",
     "openrouter/",
+    "orcarouter/",
 ];
 
-// Bare brand tokens ("claude", "anthropic") are blocked because they contain
-// no model information: a fuzzy hit from them can land on any model of the
-// brand (e.g. retired `claude-2.1` eroding to `claude` and billing at an
-// opus-fast key), so such a match is never trustworthy.
+// Bare brand tokens ("claude", "anthropic", "gemini") are blocked because they
+// contain no model information: a fuzzy hit from them can land on any model of
+// the brand (e.g. retired `claude-2.1` eroding to `claude` and billing at an
+// opus-fast key, or `gemini-default` eroding to `gemini` and landing on a
+// native-audio preview key), so such a match is never trustworthy.
 //
-// Generic English words ("model", "router") are blocked for the same reason:
-// they carry no model identity, yet substring-match real priced keys
-// (`azure_ai/model_router`, `kilo/switchpoint/router`). Without this guard an
-// id whose only fuzzy-eligible remnant after suffix stripping is the word
-// `model` (e.g. `model-zero-usage-v1` -> stripped `model`) misprices at the
-// router key's rate. See `fuzzy_match_does_not_resolve_generic_model_token`.
+// Generic English words ("model", "router", "default") are blocked for the same
+// reason: they carry no model identity, yet substring-match real priced keys
+// (`azure_ai/model_router`, `kilo/switchpoint/router`, `fireworks-ai-default`).
+// Without this guard an id whose only fuzzy-eligible remnant after suffix
+// stripping is the word `model` (e.g. `model-zero-usage-v1` -> stripped
+// `model`) misprices at the router key's rate. See
+// `fuzzy_match_does_not_resolve_generic_model_token`.
+//
+// `default` is the same failure with a live victim: the generic routing label
+// `gemini-default` strips to `default`, which fuzzy-hits LiteLLM's real
+// `fireworks-ai-default` row. That row prices at 0.0/0.0, and
+// `ModelPricing::covers_usage` treats an explicit zero as a real rate, so the
+// label looked *priced* — enough to slip past
+// `prepare_submission_pricing` and be submitted at
+// Fireworks AI's rates. A Google routing label is not a Fireworks model.
+// See `fuzzy_match_does_not_resolve_generic_default_token`.
 const FUZZY_BLOCKLIST: &[&str] = &[
     "auto",
     "mini",
@@ -64,8 +76,10 @@ const FUZZY_BLOCKLIST: &[&str] = &[
     "base",
     "claude",
     "anthropic",
+    "gemini",
     "model",
     "router",
+    "default",
 ];
 
 const MAX_LOOKUP_CACHE_ENTRIES: usize = 512;
@@ -93,6 +107,7 @@ struct CachedResult {
     pricing: ModelPricing,
     source: String,
     matched_key: String,
+    evidence: ResolutionEvidence,
 }
 
 struct KeyModelPart {
@@ -111,11 +126,22 @@ pub struct PricingLookup {
     cursor: HashMap<String, ModelPricing>,
     sakana: HashMap<String, ModelPricing>,
     models_dev: HashMap<String, ModelPricing>,
+    /// Last-known tariffs for models the upstream datasets may stop carrying.
+    ///
+    /// Deliberately not folded into `cursor`/`sakana`: those two are *current*
+    /// price sheets for models upstream never carried, and they answer with
+    /// `BuiltIn` evidence, which is unconditionally submission-safe. An
+    /// archived row is a snapshot of a rate that was real when it was taken and
+    /// may since have moved, so it is matched through the ordinary
+    /// provider-qualified path instead and can only be submission-safe when the
+    /// lookup actually proves the publishing endpoint.
+    archive: HashMap<String, ModelPricing>,
     litellm_keys: Vec<String>,
     openrouter_keys: Vec<String>,
     litellm_key_parts: Vec<KeyModelPart>,
     openrouter_key_parts: Vec<KeyModelPart>,
     models_dev_key_parts: Vec<KeyModelPart>,
+    archive_key_parts: Vec<KeyModelPart>,
     litellm_lower: HashMap<String, String>,
     openrouter_lower: HashMap<String, String>,
     models_dev_lower: HashMap<String, String>,
@@ -126,10 +152,208 @@ pub struct PricingLookup {
     lookup_cache: RwLock<HashMap<String, Option<CachedResult>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionKind {
+    Exact,
+    ModelPart,
+    ProviderPrefix,
+    /// The provider was established by an explicit scoped path or a provider
+    /// hint matched against the qualified catalog candidates.
+    ProviderScoped,
+    BuiltIn,
+    Fuzzy,
+    Custom,
+}
+
+impl ResolutionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::ModelPart => "model_part",
+            Self::ProviderPrefix => "provider_prefix",
+            Self::ProviderScoped => "provider_scoped",
+            Self::BuiltIn => "built_in",
+            Self::Fuzzy => "fuzzy",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionEvidence {
+    pub kind: ResolutionKind,
+    /// Number of usable candidates considered by a fuzzy lookup. Deterministic
+    /// paths report one.
+    pub candidate_count: usize,
+    /// Whether every considered candidate publishes the same complete rate
+    /// vector. This is deliberately stricter than comparing only input/output.
+    pub price_consensus: bool,
+    /// Whether resolution established exact model identity. Deterministic
+    /// paths establish this by construction; fuzzy paths require the selected
+    /// key's terminal model segment to exactly name the requested model.
+    pub exact_model_identity: bool,
+    pub alias_applied: bool,
+    pub normalized: bool,
+    pub stripped: bool,
+    /// Whether the matched key is rooted at a subscription namespace whose
+    /// rows publish a plan, not a tariff (see
+    /// `ZERO_PRICED_SUBSCRIPTION_NAMESPACES`).
+    ///
+    /// Independent of `kind`, because the namespace disqualifies the row no
+    /// matter how it was reached. `kind` records how strong the match was, and
+    /// a `kimi-for-coding/<model>` id is genuinely an exact hit on its own
+    /// dataset key — the key just is not a price sheet. Encoding this as a
+    /// weaker `kind` would misreport the match and would still leave every
+    /// future resolution path free to hand the row a strong kind again.
+    pub subscription_namespace: bool,
+}
+
+impl ResolutionEvidence {
+    pub(super) fn deterministic(kind: ResolutionKind) -> Self {
+        Self {
+            kind,
+            candidate_count: 1,
+            price_consensus: true,
+            exact_model_identity: true,
+            alias_applied: false,
+            normalized: false,
+            stripped: false,
+            subscription_namespace: false,
+        }
+    }
+
+    /// Why this resolution cannot be published, or `None` when it can.
+    ///
+    /// Submission diagnostics report the returned gap verbatim, so this is the
+    /// single place that decides both whether a row is publishable and what to
+    /// say about a row that is not. Deriving the message from the same match
+    /// that decides safety is what keeps a diagnostic from claiming candidates
+    /// disagreed when the lookup only ever saw one.
+    pub fn submission_safety_gap(&self) -> Option<SubmissionSafetyGap> {
+        // Checked ahead of `kind` because it disqualifies every kind. A
+        // subscription namespace prices the plan rather than the request, so
+        // the strongest possible match on one of its rows still proves only
+        // that the plan lists the model — never that the request was billed at
+        // the rate the row publishes.
+        if self.subscription_namespace {
+            return Some(SubmissionSafetyGap::UnverifiedProviderIdentity);
+        }
+        match self.kind {
+            // These fallbacks start from a bare id and add or borrow a
+            // provider-qualified row. Matching the model spelling alone does
+            // not establish that the request used that provider's price.
+            ResolutionKind::ModelPart | ResolutionKind::ProviderPrefix => {
+                return Some(SubmissionSafetyGap::UnverifiedProviderIdentity);
+            }
+            ResolutionKind::Fuzzy | ResolutionKind::ProviderScoped => {}
+            _ => return None,
+        }
+        if !self.price_consensus {
+            return Some(SubmissionSafetyGap::PriceDisagreement);
+        }
+        if !self.exact_model_identity {
+            return Some(SubmissionSafetyGap::UnverifiedModelIdentity);
+        }
+        None
+    }
+
+    pub fn is_submission_safe(&self) -> bool {
+        self.submission_safety_gap().is_none()
+    }
+
+    /// Compose evidence for a row whose missing rates were filled from
+    /// `donor`.
+    ///
+    /// The filled row publishes `donor`'s rate under its own key, so it can be
+    /// no stronger than the resolution that rate came from. Without this, a
+    /// submission-safe hinted row filled from an ambiguous fuzzy canonical row
+    /// launders that ambiguity into a submitted price: the hinted row's own
+    /// evidence says nothing about the borrowed bucket, and the leaderboard
+    /// receives a rate the resolver had already judged too weak to publish.
+    fn borrowing_from(&self, donor: &Self) -> Self {
+        Self {
+            // A donor that could not be published on its own is the composed
+            // row's weakest link, so report its kind rather than the stronger
+            // kind of the row being filled.
+            kind: if donor.is_submission_safe() {
+                self.kind
+            } else {
+                donor.kind
+            },
+            candidate_count: self.candidate_count.max(donor.candidate_count),
+            price_consensus: self.price_consensus && donor.price_consensus,
+            exact_model_identity: self.exact_model_identity && donor.exact_model_identity,
+            alias_applied: self.alias_applied || donor.alias_applied,
+            normalized: self.normalized || donor.normalized,
+            stripped: self.stripped || donor.stripped,
+            // Either side taints the composed row: the filled row is quoted
+            // under its own key, and it quotes the donor's rates. `kind` alone
+            // does not carry this, because a subscription-namespace donor can
+            // hold a perfectly strong kind.
+            subscription_namespace: self.subscription_namespace || donor.subscription_namespace,
+        }
+    }
+}
+
+/// Why a resolution is not safe to publish to the shared leaderboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionSafetyGap {
+    /// The considered candidates do not publish the same rates, so the
+    /// selected candidate's price is one of several conflicting answers.
+    PriceDisagreement,
+    /// No candidate names the requested model exactly, so the price belongs to
+    /// a model that merely resembles the one that was used.
+    UnverifiedModelIdentity,
+    /// A bare model id resolved through another provider's qualified catalog
+    /// key, without evidence that the request used that provider's price.
+    UnverifiedProviderIdentity,
+}
+
+#[derive(Debug, Clone)]
 pub struct LookupResult {
     pub pricing: ModelPricing,
     pub source: String,
     pub matched_key: String,
+    pub evidence: ResolutionEvidence,
+}
+
+impl LookupResult {
+    fn with_kind(mut self, kind: ResolutionKind) -> Self {
+        self.evidence.kind = kind;
+        self
+    }
+
+    fn with_alias(mut self) -> Self {
+        self.evidence.alias_applied = true;
+        self
+    }
+
+    fn with_normalization(mut self) -> Self {
+        self.evidence.normalized = true;
+        self
+    }
+
+    fn with_stripping(mut self) -> Self {
+        self.evidence.stripped = true;
+        self
+    }
+
+    /// Record whether the selected key is rooted at a zero-priced subscription
+    /// namespace.
+    ///
+    /// Read off the key at the end of resolution rather than stamped at each
+    /// construction site: resolution has many terminal branches (full-key
+    /// exact, model-part, provider-scoped, stripped prefix or suffix, forced
+    /// source, generic-prefix retry), every one of them can land on such a
+    /// row, and only some of them ever consult a provider hint.
+    /// `key_root_matches_provider_hint` guards the hint-driven promotion; this
+    /// covers the rest, including the id that IS the qualified key and so
+    /// takes the full-key exact branch without a hint being involved at all.
+    fn with_subscription_namespace_check(mut self) -> Self {
+        self.evidence.subscription_namespace =
+            key_root_is_zero_priced_subscription_namespace(&self.matched_key);
+        self
+    }
 }
 
 impl PricingLookup {
@@ -144,6 +368,17 @@ impl PricingLookup {
         Self::new_with_models_dev(litellm, openrouter, cursor, HashMap::new(), HashMap::new())
     }
 
+    // @keep: the omission of cursor/sakana is the whole point and reads like a bug otherwise.
+    /// True when at least one *fetchable* upstream dataset loaded.
+    ///
+    /// The `cursor`, `sakana` and `archive` tables are compiled-in constants
+    /// that are present on every run, so they are deliberately not consulted:
+    /// counting them would report healthy pricing during a total upstream
+    /// outage, which is exactly the condition callers use this to detect.
+    pub fn has_upstream_dataset(&self) -> bool {
+        !self.litellm.is_empty() || !self.openrouter.is_empty() || !self.models_dev.is_empty()
+    }
+
     pub fn new_with_models_dev(
         litellm: HashMap<String, ModelPricing>,
         openrouter: HashMap<String, ModelPricing>,
@@ -151,14 +386,49 @@ impl PricingLookup {
         sakana: HashMap<String, ModelPricing>,
         models_dev: HashMap<String, ModelPricing>,
     ) -> Self {
+        Self::new_with_archive(
+            litellm,
+            openrouter,
+            cursor,
+            sakana,
+            models_dev,
+            HashMap::new(),
+        )
+    }
+
+    // @keep: the reason this is a separate constructor and not a sixth
+    // parameter on `new_with_models_dev` is the whole design, and reads like
+    // gratuitous API surface otherwise.
+    /// Full wiring, including the retirement archive of last-known tariffs.
+    ///
+    /// The archive is the only table here that can answer for a model no live
+    /// dataset carries, so a test that wants to observe upstream-only
+    /// resolution — including the absence of a price — has to be able to build
+    /// a lookup without it. Production always goes through `PricingService`,
+    /// which always passes it.
+    pub fn new_with_archive(
+        litellm: HashMap<String, ModelPricing>,
+        openrouter: HashMap<String, ModelPricing>,
+        cursor: HashMap<String, ModelPricing>,
+        sakana: HashMap<String, ModelPricing>,
+        models_dev: HashMap<String, ModelPricing>,
+        archive: HashMap<String, ModelPricing>,
+    ) -> Self {
+        // Longest key first, then alphabetical. The alphabetical leg only pins
+        // equal-length ties so a run is reproducible; it carries no pricing
+        // meaning, and the cheaper or more authoritative row does not win by
+        // being sorted earlier.
         let mut litellm_keys: Vec<String> = litellm.keys().cloned().collect();
-        litellm_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        litellm_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         let mut openrouter_keys: Vec<String> = openrouter.keys().cloned().collect();
-        openrouter_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        openrouter_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         let mut models_dev_keys: Vec<String> = models_dev.keys().cloned().collect();
-        models_dev_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        models_dev_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+        let mut archive_keys: Vec<String> = archive.keys().cloned().collect();
+        archive_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         let mut litellm_lower = HashMap::with_capacity(litellm.len());
         for key in &litellm_keys {
@@ -236,6 +506,7 @@ impl PricingLookup {
         let litellm_key_parts = build_key_parts(&litellm_keys);
         let openrouter_key_parts = build_key_parts(&openrouter_keys);
         let models_dev_key_parts = build_key_parts(&models_dev_keys);
+        let archive_key_parts = build_key_parts(&archive_keys);
 
         Self {
             litellm,
@@ -243,11 +514,13 @@ impl PricingLookup {
             cursor,
             sakana,
             models_dev,
+            archive,
             litellm_keys,
             openrouter_keys,
             litellm_key_parts,
             openrouter_key_parts,
             models_dev_key_parts,
+            archive_key_parts,
             litellm_lower,
             openrouter_lower,
             models_dev_lower,
@@ -280,6 +553,7 @@ impl PricingLookup {
                 pricing: c.pricing,
                 source: c.source,
                 matched_key: c.matched_key,
+                evidence: c.evidence,
             });
         }
 
@@ -302,6 +576,7 @@ impl PricingLookup {
                     pricing: r.pricing.clone(),
                     source: r.source.clone(),
                     matched_key: r.matched_key.clone(),
+                    evidence: r.evidence.clone(),
                 }),
             );
         }
@@ -317,21 +592,80 @@ impl PricingLookup {
         self.lookup_with_source_and_provider(model_id, force_source, None)
     }
 
+    /// Resolve a model id, then judge the selected key's namespace.
+    ///
+    /// The namespace check runs here, on the way out, because this is the one
+    /// place every dataset resolution passes through. `resolve_with_source`
+    /// below has a dozen terminal `return`s across the alias, exact,
+    /// model-part, provider-scoped, prefix-strip and suffix-strip branches;
+    /// stamping the flag on each of them would leave the next branch anybody
+    /// adds unguarded, which is exactly how the full-key exact branch came to
+    /// hand a `kimi-for-coding/*` row submission-safe `Exact` evidence while
+    /// the promotion path was already refusing it.
+    ///
+    /// Custom pricing is resolved by `PricingService` and never reaches here,
+    /// which is deliberate: an entry in `custom-pricing.json` is the user
+    /// asserting a rate for their own id, not a dataset row being read as one.
     pub fn lookup_with_source_and_provider(
         &self,
         model_id: &str,
         force_source: Option<&str>,
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
+        self.resolve_with_source_and_provider(model_id, force_source, provider_id)
+            .map(LookupResult::with_subscription_namespace_check)
+    }
+
+    fn resolve_with_source_and_provider(
+        &self,
+        model_id: &str,
+        force_source: Option<&str>,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        // Parsers use this namespace when they know which model responded but
+        // the source does not establish whether the route was metered,
+        // subscription-backed, or custom. Preserve the model for reporting,
+        // but never turn that incomplete route into an upstream API estimate.
+        // An exact custom-pricing entry is still consulted by PricingService
+        // before this lookup and remains the explicit user escape hatch.
+        if provider_id.is_some_and(is_unpriced_provider) {
+            return None;
+        }
+
+        if force_source.is_none() {
+            if let Some(result) = self_hosted::lookup(model_id, provider_id) {
+                return Some(result);
+            }
+        }
+
+        // A router is not a model. Resolving one by model-part match elects
+        // whatever unrelated vendor publishes the same word, and the result is
+        // billed as if it were the real thing (#1062).
+        if is_routing_label(model_id) {
+            return None;
+        }
+
         let provider_id = normalize_provider_hint(provider_id);
-        let canonical = aliases::resolve_alias(model_id).unwrap_or(model_id);
+        let resolved_alias = aliases::resolve_alias(model_id);
+        let canonical = resolved_alias.unwrap_or(model_id);
+        let alias_applied = resolved_alias.is_some();
         let lower = canonical.to_lowercase();
 
         // CLIProxyAPI strips `(level)` reasoning-effort suffixes before routing,
         // so for pricing lookup we resolve to the base model regardless of tier.
         // Mirrors the dash-suffix path (e.g. `-xhigh`), which is handled by
         // `try_strip_unknown_suffix` below.
-        let normalized_owned = strip_parenthesized_reasoning_tier(&lower).map(str::to_owned);
+        let tier_normalized_owned = strip_parenthesized_reasoning_tier(&lower).map(str::to_owned);
+
+        // A tier suffix does not turn a router into a model: `auto(high)`
+        // normalizes to `auto` below and would otherwise reach the model-part
+        // fallback and elect an unrelated vendor, exactly as the bare form did.
+        if tier_normalized_owned
+            .as_deref()
+            .is_some_and(is_routing_label)
+        {
+            return None;
+        }
 
         // Guard against silent misresolution: if the input ends with `(...)`
         // but the contents are not a recognized CLIProxyAPI level, refuse the
@@ -339,7 +673,7 @@ impl PricingLookup {
         // `-` and could match a shorter, unrelated model id by peeling the
         // parenthesized fragment off (e.g. `gpt-5.2-codex(invalid)` would
         // strip `-codex(invalid)` and resolve to `gpt-5.2`).
-        if normalized_owned.is_none()
+        if tier_normalized_owned.is_none()
             && lower
                 .strip_suffix(')')
                 .and_then(|inner| inner.rsplit_once('('))
@@ -348,17 +682,33 @@ impl PricingLookup {
             return None;
         }
 
-        let lower_ref: &str = normalized_owned.as_deref().unwrap_or(&lower);
+        let tier_normalized_ref = tier_normalized_owned.as_deref().unwrap_or(&lower);
+        let fast_normalized_owned = normalize_openai_fast_mode(tier_normalized_ref, provider_id);
+        let lower_ref = fast_normalized_owned
+            .as_deref()
+            .unwrap_or(tier_normalized_ref);
+        let normalized = tier_normalized_owned.is_some() || fast_normalized_owned.is_some();
 
-        // Helper to perform lookup with the given source constraint
-        let do_lookup = |id: &str| match force_source {
+        if alias_applied && force_source.is_none() && aliases::uses_cursor_pricing(model_id) {
+            if let Some(result) = self.exact_match_cursor(lower_ref) {
+                return Some(result.with_alias());
+            }
+        }
+
+        // Helper to perform lookup with the given source constraint.
+        // `allow_archive` is false for the ids the suffix stripper invents:
+        // an archived row is one model's own last published tariff, not a
+        // family price, so an eroded candidate must resolve from the live
+        // datasets alone. The forced-source paths never reach the archive.
+        let lookup = |id: &str, allow_archive: bool| match force_source {
             Some("litellm") => self.lookup_litellm_only(id, provider_id),
             Some("openrouter") => self.lookup_openrouter_only(id, provider_id),
             Some("models.dev") | Some("modelsdev") | Some("models_dev") => {
                 self.lookup_models_dev_only(id, provider_id)
             }
-            _ => self.lookup_auto(id, provider_id),
+            _ => self.lookup_auto(id, provider_id, allow_archive),
         };
+        let do_lookup = |id: &str| lookup(id, true);
         let requested_family = claude_family(lower_ref);
         let requested_version = requested_claude_version(lower_ref);
         let unparsed_modern_version = requested_family.is_some()
@@ -373,8 +723,28 @@ impl PricingLookup {
             )
         };
 
+        let annotate_direct = |mut result: LookupResult| {
+            if alias_applied {
+                result = result.with_alias();
+            }
+            if normalized {
+                result = result.with_normalization();
+            }
+            if matches_inferred_model_provider(lower_ref, provider_id)
+                && provider_id
+                    .is_some_and(|hint| key_root_matches_provider_hint(&result.matched_key, hint))
+                && matches!(
+                    result.evidence.kind,
+                    ResolutionKind::ModelPart | ResolutionKind::ProviderPrefix
+                )
+            {
+                result = result.with_kind(ResolutionKind::ProviderScoped);
+            }
+            result
+        };
+
         // 1. Try direct lookup
-        if let Some(result) = do_lookup(lower_ref) {
+        if let Some(result) = do_lookup(lower_ref).map(annotate_direct) {
             if unsafe_claude_resolution(&result) {
                 return None;
             }
@@ -385,9 +755,16 @@ impl PricingLookup {
             return None;
         }
 
-        let guarded_lookup = |candidate: &str| {
-            do_lookup(candidate).filter(|result| !unsafe_claude_resolution(result))
+        let guarded = |candidate: &str, allow_archive: bool| {
+            lookup(candidate, allow_archive)
+                .map(annotate_direct)
+                .map(LookupResult::with_stripping)
+                .filter(|result| !unsafe_claude_resolution(result))
         };
+        let guarded_lookup = |candidate: &str| guarded(candidate, true);
+        // Suffix erosion asks for an id nobody published, so it resolves
+        // live-only: see `try_strip_unknown_suffix`.
+        let eroded_lookup = |candidate: &str| guarded(candidate, false);
 
         // 1.5. Generic provider-routing prefix fallback: ids coming from a
         // router/proxy (e.g. `cx/gpt-5.5` via an `omniroute` provider) carry a
@@ -400,28 +777,55 @@ impl PricingLookup {
         // the `/`-scoped fallbacks already used by the Cursor/Sakana exact
         // matchers.
         if let Some(terminal) = strip_generic_provider_prefix(lower_ref) {
+            // Reaching here means no dataset key matched the qualified id, so
+            // an unrecognized vendor prefix is being dropped to retry the bare
+            // model. A real `morph/auto` resolved long before this point; a
+            // made-up `cx/auto` would arrive here and be billed as Morph.
+            if is_routing_label(terminal) {
+                return None;
+            }
+
             if let Some(result) = guarded_lookup(terminal) {
+                return Some(result);
+            }
+
+            // The terminal segment can still carry a tier suffix, and the two
+            // transformations have to compose here or they never meet: the
+            // suffix stage below only ever sees the prefixed id, and it splits
+            // on `-`, so it can peel `-xhigh` off `cx/gpt-5.5-xhigh` but is
+            // left with `cx/gpt-5.5`, which is not a dataset key either. Both
+            // halves resolve alone while the combination billed $0 (#846).
+            if let Some(result) = try_strip_unknown_suffix(terminal, eroded_lookup) {
                 return Some(result);
             }
         }
 
         // 2. Try stripping unknown suffixes (e.g., -thinking, -high, -codex)
-        if let Some(result) = try_strip_unknown_suffix(lower_ref, guarded_lookup) {
+        if let Some(result) = try_strip_unknown_suffix(lower_ref, eroded_lookup) {
             return Some(result);
         }
 
         // 3. Try stripping unknown prefixes (e.g., antigravity-, myplugin-)
         //    For each prefix candidate, also try suffix stripping
-        if let Some(result) = try_strip_unknown_prefix(lower_ref, guarded_lookup) {
+        if let Some(result) = try_strip_unknown_prefix(lower_ref, guarded_lookup, eroded_lookup) {
             return Some(result);
         }
 
         None
     }
 
-    fn lookup_auto(&self, model_id: &str, provider_id: Option<&str>) -> Option<LookupResult> {
+    /// `allow_archive` is false when the caller invented the id it is asking
+    /// about -- the suffix stripper's eroded candidates. The archive holds one
+    /// model's own last published tariff, so it may answer an id somebody
+    /// really published, never a neighbouring SKU.
+    fn lookup_auto(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        allow_archive: bool,
+    ) -> Option<LookupResult> {
         if let Some(result) = self.lookup_provider_scoped_path(model_id, provider_id) {
-            return Some(result);
+            return Some(scope_resolution_to_provider(result, model_id));
         }
         if parse_provider_scoped_model_path(model_id).is_some() {
             return None;
@@ -437,7 +841,9 @@ impl PricingLookup {
                 }
 
                 let exact_openrouter = self.exact_match_openrouter(model_id);
-                let stripped_litellm = self.exact_or_normalized_litellm(stripped, provider_id);
+                let stripped_litellm = self
+                    .exact_or_normalized_litellm(stripped, provider_id)
+                    .map(LookupResult::with_stripping);
 
                 if let (Some(litellm), Some(openrouter)) = (&stripped_litellm, &exact_openrouter) {
                     if has_meaningful_tier_support(&litellm.pricing)
@@ -459,36 +865,58 @@ impl PricingLookup {
                 if let Some(result) =
                     self.exact_match_models_dev_with_provider(stripped, provider_id)
                 {
-                    return Some(result);
+                    return Some(result.with_stripping());
                 }
             } else {
-                if let Some(result) = choose_best_source_result(
+                if let Some(result) = choose_best_source_result_with_models_dev(
                     self.exact_match_litellm_for_provider(stripped, provider_id),
-                    self.exact_match_openrouter_for_provider(stripped, provider_id),
+                    self.exact_or_normalized_openrouter_for_provider(stripped, provider_id),
+                    self.exact_match_models_dev_for_provider(stripped, provider_id),
                     provider_id,
                 ) {
-                    return Some(result);
+                    return Some(self.prefer_proven_archive(
+                        result.with_stripping(),
+                        model_id,
+                        provider_id,
+                        allow_archive,
+                    ));
                 }
                 if let Some(result) = self.exact_or_normalized_litellm(stripped, provider_id) {
-                    return Some(result);
+                    return Some(self.prefer_proven_archive(
+                        result.with_stripping(),
+                        model_id,
+                        provider_id,
+                        allow_archive,
+                    ));
                 }
                 if let Some(result) =
                     self.exact_match_models_dev_with_provider(stripped, provider_id)
                 {
-                    return Some(result);
+                    return Some(self.prefer_proven_archive(
+                        result.with_stripping(),
+                        model_id,
+                        provider_id,
+                        allow_archive,
+                    ));
                 }
             }
         }
 
-        if let Some(result) = choose_best_source_result(
-            self.exact_match_litellm_for_provider(model_id, provider_id),
-            self.exact_match_openrouter_for_provider(model_id, provider_id),
-            provider_id,
-        ) {
-            return Some(result);
+        let exact_litellm = self.exact_match_litellm(model_id);
+        if should_prefer_openai_tiered_litellm(model_id, provider_id, exact_litellm.as_ref()) {
+            return exact_litellm;
         }
 
-        if let Some(result) = self.exact_match_litellm(model_id) {
+        if let Some(result) = choose_best_source_result_with_models_dev(
+            self.exact_match_litellm_for_provider(model_id, provider_id),
+            self.exact_or_normalized_openrouter_for_provider(model_id, provider_id),
+            self.exact_match_models_dev_for_provider(model_id, provider_id),
+            provider_id,
+        ) {
+            return Some(self.prefer_proven_archive(result, model_id, provider_id, allow_archive));
+        }
+
+        if let Some(result) = exact_litellm {
             return Some(result);
         }
         // An unscoped OpenRouter FULL-KEY match is the id's own canonical key,
@@ -509,11 +937,16 @@ impl PricingLookup {
         // matching key falls through to the canonical resolution below.
         if provider_id.is_some() {
             if let Some(result) = self.exact_match_models_dev_for_provider(model_id, provider_id) {
-                return Some(result);
+                return Some(self.prefer_proven_archive(
+                    result,
+                    model_id,
+                    provider_id,
+                    allow_archive,
+                ));
             }
         }
         if let Some(result) = self.exact_match_openrouter_model_part(model_id) {
-            return Some(result);
+            return Some(self.prefer_proven_archive(result, model_id, provider_id, allow_archive));
         }
 
         // Separator-normalized exact passes against the canonical sources
@@ -525,79 +958,131 @@ impl PricingLookup {
         // for UNhinted lookups: the provider-scoped passes above and below
         // keep provider-hinted resolutions pinned to the hinted provider.
         if let Some(version_normalized) = normalize_version_separator(model_id) {
-            if let Some(result) = choose_best_source_result(
+            if let Some(result) = choose_best_source_result_with_models_dev(
                 self.exact_match_litellm_for_provider(&version_normalized, provider_id),
                 self.exact_match_openrouter_for_provider(&version_normalized, provider_id),
+                self.exact_match_models_dev_for_provider(&version_normalized, provider_id),
                 provider_id,
             ) {
-                return Some(result);
+                return Some(self.prefer_proven_archive(
+                    result.with_normalization(),
+                    &version_normalized,
+                    provider_id,
+                    allow_archive,
+                ));
             }
             if provider_id.is_some() {
                 if let Some(result) =
                     self.exact_match_models_dev_for_provider(&version_normalized, provider_id)
                 {
-                    return Some(result);
+                    return Some(self.prefer_proven_archive(
+                        result.with_normalization(),
+                        &version_normalized,
+                        provider_id,
+                        allow_archive,
+                    ));
                 }
             }
             if let Some(result) = self.exact_match_litellm(&version_normalized) {
-                return Some(result);
+                return Some(result.with_normalization());
             }
             if let Some(result) = self.exact_match_openrouter(&version_normalized) {
-                return Some(result);
+                return Some(self.prefer_proven_archive(
+                    result.with_normalization(),
+                    &version_normalized,
+                    provider_id,
+                    allow_archive,
+                ));
             }
         }
 
         if let Some(result) = self.exact_match_models_dev_with_provider(model_id, provider_id) {
-            return Some(result);
+            return Some(self.prefer_proven_archive(result, model_id, provider_id, allow_archive));
         }
         if let Some(version_normalized) = normalize_version_separator(model_id) {
             if let Some(result) =
                 self.exact_match_models_dev_with_provider(&version_normalized, provider_id)
             {
-                return Some(result);
+                return Some(self.prefer_proven_archive(
+                    result.with_normalization(),
+                    &version_normalized,
+                    provider_id,
+                    allow_archive,
+                ));
             }
         }
 
         if let Some(normalized) = normalize_model_name(model_id) {
-            if let Some(result) = choose_best_source_result(
+            if let Some(result) = choose_best_source_result_with_models_dev(
                 self.exact_match_litellm_for_provider(&normalized, provider_id),
                 self.exact_match_openrouter_for_provider(&normalized, provider_id),
+                self.exact_match_models_dev_for_provider(&normalized, provider_id),
                 provider_id,
             ) {
-                return Some(result);
+                return Some(self.prefer_proven_archive(
+                    result.with_normalization(),
+                    &normalized,
+                    provider_id,
+                    allow_archive,
+                ));
             }
             if let Some(result) = self.exact_match_litellm(&normalized) {
-                return Some(result);
+                return Some(result.with_normalization());
             }
             if let Some(result) = self.exact_match_openrouter(&normalized) {
-                return Some(result);
+                return Some(self.prefer_proven_archive(
+                    result.with_normalization(),
+                    &normalized,
+                    provider_id,
+                    allow_archive,
+                ));
             }
             if let Some(result) =
                 self.exact_match_models_dev_with_provider(&normalized, provider_id)
             {
-                return Some(result);
+                return Some(self.prefer_proven_archive(
+                    result.with_normalization(),
+                    &normalized,
+                    provider_id,
+                    allow_archive,
+                ));
             }
         }
 
         if let Some(result) = self.prefix_match_litellm(model_id, provider_id) {
-            return Some(result);
+            return Some(self.prefer_proven_archive(result, model_id, provider_id, allow_archive));
         }
         if let Some(result) = self.prefix_match_openrouter(model_id, provider_id) {
-            return Some(result);
+            return Some(self.prefer_proven_archive(result, model_id, provider_id, allow_archive));
         }
         if let Some(result) = self.prefix_match_models_dev(model_id, provider_id) {
-            return Some(result);
+            return Some(self.prefer_proven_archive(result, model_id, provider_id, allow_archive));
         }
 
         if let Some(version_normalized) = normalize_version_separator(model_id) {
             if let Some(result) = self.prefix_match_litellm(&version_normalized, provider_id) {
-                return Some(result);
+                return Some(self.prefer_proven_archive(
+                    result.with_normalization(),
+                    &version_normalized,
+                    provider_id,
+                    allow_archive,
+                ));
             }
             if let Some(result) = self.prefix_match_openrouter(&version_normalized, provider_id) {
-                return Some(result);
+                return Some(self.prefer_proven_archive(
+                    result.with_normalization(),
+                    &version_normalized,
+                    provider_id,
+                    allow_archive,
+                ));
             }
             if let Some(result) = self.prefix_match_models_dev(&version_normalized, provider_id) {
-                return Some(result);
+                return Some(self.prefer_proven_archive(
+                    result.with_normalization(),
+                    &version_normalized,
+                    provider_id,
+                    allow_archive,
+                ));
             }
         }
 
@@ -606,7 +1091,7 @@ impl PricingLookup {
         }
         if let Some(version_normalized) = normalize_version_separator(model_id) {
             if let Some(result) = self.exact_match_cursor(&version_normalized) {
-                return Some(result);
+                return Some(result.with_normalization());
             }
         }
 
@@ -619,6 +1104,17 @@ impl PricingLookup {
         }
         if let Some(version_normalized) = normalize_version_separator(model_id) {
             if let Some(result) = self.exact_match_sakana(&version_normalized) {
+                return Some(result.with_normalization());
+            }
+        }
+
+        // The retirement archive answers only once every live dataset has
+        // failed, so a model still carried upstream never reaches it. It still
+        // runs ahead of the fuzzy stage below: an exact snapshot of this
+        // model's own last published rate is better evidence than the
+        // nearest-neighbour row fuzzy would elect.
+        if allow_archive {
+            if let Some(result) = self.exact_match_archive(model_id, provider_id) {
                 return Some(result);
             }
         }
@@ -629,8 +1125,34 @@ impl PricingLookup {
 
         let litellm_result = self.fuzzy_match_litellm(model_id, provider_id);
         let openrouter_result = self.fuzzy_match_openrouter(model_id, provider_id);
+        let fuzzy_results = [litellm_result.as_ref(), openrouter_result.as_ref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let candidate_count = fuzzy_results
+            .iter()
+            .map(|result| result.evidence.candidate_count)
+            .sum();
+        let price_consensus = fuzzy_results.first().is_some_and(|first| {
+            first.evidence.price_consensus
+                && fuzzy_results.iter().skip(1).all(|result| {
+                    result.evidence.price_consensus
+                        && pricing_rows_equal(&first.pricing, &result.pricing)
+                })
+        });
+        let exact_model_identity = !fuzzy_results.is_empty()
+            && fuzzy_results
+                .iter()
+                .all(|result| result.evidence.exact_model_identity);
 
-        choose_best_source_result(litellm_result, openrouter_result, provider_id)
+        choose_best_source_result(litellm_result, openrouter_result, provider_id).map(
+            |mut result| {
+                result.evidence.candidate_count = candidate_count;
+                result.evidence.price_consensus = price_consensus;
+                result.evidence.exact_model_identity = exact_model_identity;
+                result
+            },
+        )
     }
 
     fn exact_or_normalized_litellm(
@@ -648,21 +1170,51 @@ impl PricingLookup {
             if let Some(result) =
                 self.exact_match_litellm_for_provider(&version_normalized, provider_id)
             {
-                return Some(result);
+                return Some(result.with_normalization());
             }
             if let Some(result) = self.exact_match_litellm(&version_normalized) {
-                return Some(result);
+                return Some(result.with_normalization());
             }
         }
         if let Some(normalized) = normalize_model_name(model_id) {
             if let Some(result) = self.exact_match_litellm_for_provider(&normalized, provider_id) {
-                return Some(result);
+                return Some(result.with_normalization());
             }
             if let Some(result) = self.exact_match_litellm(&normalized) {
-                return Some(result);
+                return Some(result.with_normalization());
             }
         }
         None
+    }
+
+    /// [`exact_match_openrouter_for_provider`], retrying the
+    /// separator-normalized spelling when the raw one finds nothing.
+    ///
+    /// OpenRouter dots minor versions (`anthropic/claude-haiku-4.5`) where
+    /// LiteLLM and callers hyphenate (`claude-haiku-4-5`). The provider-scoped
+    /// exact stages below compare raw spellings and return early, so without
+    /// this retry a hint-matching reseller LiteLLM row can win the stage
+    /// outright while OpenRouter's first-party entry — the one the hint
+    /// actually names — never participates in arbitration at all (#1329).
+    fn exact_or_normalized_openrouter_for_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.exact_match_openrouter_for_provider(model_id, provider_id) {
+            return Some(result);
+        }
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) =
+                self.exact_match_openrouter_for_provider(&version_normalized, provider_id)
+            {
+                return Some(result.with_normalization());
+            }
+        }
+        normalize_model_name(model_id).and_then(|normalized| {
+            self.exact_match_openrouter_for_provider(&normalized, provider_id)
+                .map(LookupResult::with_normalization)
+        })
     }
 
     fn lookup_models_dev_only(
@@ -681,14 +1233,14 @@ impl PricingLookup {
             if let Some(result) =
                 self.exact_match_models_dev_with_provider(&version_normalized, provider_id)
             {
-                return Some(result);
+                return Some(result.with_normalization());
             }
         }
         if let Some(normalized) = normalize_model_name(model_id) {
             if let Some(result) =
                 self.exact_match_models_dev_with_provider(&normalized, provider_id)
             {
-                return Some(result);
+                return Some(result.with_normalization());
             }
         }
         if let Some(result) = self.prefix_match_models_dev(model_id, provider_id) {
@@ -696,7 +1248,7 @@ impl PricingLookup {
         }
         if let Some(version_normalized) = normalize_version_separator(model_id) {
             if let Some(result) = self.prefix_match_models_dev(&version_normalized, provider_id) {
-                return Some(result);
+                return Some(result.with_normalization());
             }
         }
         None
@@ -708,7 +1260,7 @@ impl PricingLookup {
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
         if let Some(result) = self.lookup_provider_scoped_path_litellm(model_id, provider_id) {
-            return Some(result);
+            return Some(scope_resolution_to_provider(result, model_id));
         }
         if parse_provider_scoped_model_path(model_id).is_some() {
             return None;
@@ -719,7 +1271,7 @@ impl PricingLookup {
         }
         if let Some(stripped) = strip_known_provider_prefix(model_id) {
             if let Some(result) = self.exact_or_normalized_litellm(stripped, provider_id) {
-                return Some(result);
+                return Some(result.with_stripping());
             }
         }
         if let Some(result) = self.prefix_match_litellm(model_id, provider_id) {
@@ -727,7 +1279,7 @@ impl PricingLookup {
         }
         if let Some(version_normalized) = normalize_version_separator(model_id) {
             if let Some(result) = self.prefix_match_litellm(&version_normalized, provider_id) {
-                return Some(result);
+                return Some(result.with_normalization());
             }
         }
         if is_fuzzy_eligible(model_id) {
@@ -744,7 +1296,7 @@ impl PricingLookup {
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
         if let Some(result) = self.lookup_provider_scoped_path_openrouter(model_id, provider_id) {
-            return Some(result);
+            return Some(scope_resolution_to_provider(result, model_id));
         }
         if parse_provider_scoped_model_path(model_id).is_some() {
             return None;
@@ -757,14 +1309,14 @@ impl PricingLookup {
             if let Some(result) =
                 self.exact_match_openrouter_with_provider(&version_normalized, provider_id)
             {
-                return Some(result);
+                return Some(result.with_normalization());
             }
         }
         if let Some(normalized) = normalize_model_name(model_id) {
             if let Some(result) =
                 self.exact_match_openrouter_with_provider(&normalized, provider_id)
             {
-                return Some(result);
+                return Some(result.with_normalization());
             }
         }
         if let Some(result) = self.prefix_match_openrouter(model_id, provider_id) {
@@ -772,7 +1324,7 @@ impl PricingLookup {
         }
         if let Some(version_normalized) = normalize_version_separator(model_id) {
             if let Some(result) = self.prefix_match_openrouter(&version_normalized, provider_id) {
-                return Some(result);
+                return Some(result.with_normalization());
             }
         }
         if is_fuzzy_eligible(model_id) {
@@ -934,10 +1486,26 @@ impl PricingLookup {
     /// model-part equals `model_id`. A provider hint must take precedence over
     /// this (see `lookup_auto`), otherwise a hinted lookup leaks to a different
     /// provider's canonical key.
+    ///
+    /// The model-part index is a cross-provider fallback in the same trust
+    /// class as fuzzy matching: it lands the id on "some other provider's
+    /// model whose model-part equals this id". Generic tokens on the
+    /// `FUZZY_BLOCKLIST` carry no model identity, and #1070's resolver-top
+    /// `is_routing_label` guard already refuses the router labels it knows
+    /// (`auto`, `agent_review`). This blocklist gate is the second layer:
+    /// it covers generic tokens no parser emits today but any provider could
+    /// publish as a model part tomorrow (`default`, `router`, `mini`, ...),
+    /// and it protects any path that reaches the model-part index without
+    /// passing through that guard. Full-key matches, which are the id's own
+    /// canonical key, stay honored.
     fn exact_match_openrouter_model_part(&self, model_id: &str) -> Option<LookupResult> {
+        if FUZZY_BLOCKLIST.contains(&model_id) {
+            return None;
+        }
         let key = self.openrouter_model_part.get(model_id)?;
         let pricing = self.openrouter.get(key)?;
         lookup_result_if_usable(pricing, "OpenRouter", key)
+            .map(|result| result.with_kind(ResolutionKind::ModelPart))
     }
 
     fn exact_match_models_dev(&self, model_id: &str) -> Option<LookupResult> {
@@ -947,16 +1515,24 @@ impl PricingLookup {
                     pricing: pricing.clone(),
                     source: "Models.dev".into(),
                     matched_key: key.clone(),
+                    evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
                 });
             }
         }
-        if let Some(key) = self.models_dev_model_part.get(model_id) {
-            if let Some(pricing) = self.models_dev.get(key) {
-                return Some(LookupResult {
-                    pricing: pricing.clone(),
-                    source: "Models.dev".into(),
-                    matched_key: key.clone(),
-                });
+        // Same cross-provider fallback trust class as the OpenRouter model-part
+        // index: #1070's resolver-top guard plus this blocklist gate keep bare
+        // generic tokens off another provider's model part, while the id's own
+        // full dataset key (`morph/auto`) still resolves.
+        if !FUZZY_BLOCKLIST.contains(&model_id) {
+            if let Some(key) = self.models_dev_model_part.get(model_id) {
+                if let Some(pricing) = self.models_dev.get(key) {
+                    return Some(LookupResult {
+                        pricing: pricing.clone(),
+                        source: "Models.dev".into(),
+                        matched_key: key.clone(),
+                        evidence: ResolutionEvidence::deterministic(ResolutionKind::ModelPart),
+                    });
+                }
             }
         }
         None
@@ -964,12 +1540,14 @@ impl PricingLookup {
 
     fn exact_match_cursor(&self, model_id: &str) -> Option<LookupResult> {
         if let Some(key) = self.cursor_lower.get(model_id) {
-            return lookup_result_if_usable(self.cursor.get(key).unwrap(), "Cursor", key);
+            return lookup_result_if_usable(self.cursor.get(key).unwrap(), "Cursor", key)
+                .map(|result| result.with_kind(ResolutionKind::BuiltIn));
         }
         if let Some(model_part) = model_id.split('/').next_back() {
             if model_part != model_id {
                 if let Some(key) = self.cursor_lower.get(model_part) {
-                    return lookup_result_if_usable(self.cursor.get(key).unwrap(), "Cursor", key);
+                    return lookup_result_if_usable(self.cursor.get(key).unwrap(), "Cursor", key)
+                        .map(|result| result.with_kind(ResolutionKind::BuiltIn));
                 }
             }
         }
@@ -978,16 +1556,130 @@ impl PricingLookup {
 
     fn exact_match_sakana(&self, model_id: &str) -> Option<LookupResult> {
         if let Some(key) = self.sakana_lower.get(model_id) {
-            return lookup_result_if_usable(self.sakana.get(key).unwrap(), "Sakana", key);
+            return lookup_result_if_usable(self.sakana.get(key).unwrap(), "Sakana", key)
+                .map(|result| result.with_kind(ResolutionKind::BuiltIn));
         }
         if let Some(model_part) = model_id.split('/').next_back() {
             if model_part != model_id {
                 if let Some(key) = self.sakana_lower.get(model_part) {
-                    return lookup_result_if_usable(self.sakana.get(key).unwrap(), "Sakana", key);
+                    return lookup_result_if_usable(self.sakana.get(key).unwrap(), "Sakana", key)
+                        .map(|result| result.with_kind(ResolutionKind::BuiltIn));
                 }
             }
         }
         None
+    }
+
+    /// Prefer a provider-proven archive tariff over an unverified upstream guess.
+    ///
+    /// Every unverified fallback stage in `lookup_auto` (model-part, alias and
+    /// prefix matches) routes through here. Reseller rows
+    /// (`deepinfra/anthropic/...`, `z-ai/...`) match those stages by model
+    /// part while the archive holds the publishing endpoint's own exact
+    /// tariff; letting the guess win prices first-party usage at a third
+    /// party's rate and reports it as unpublishable. Safe upstream rows pass
+    /// through untouched, as does everything when the archive cannot prove
+    /// the endpoint -- so display estimates never change, only their
+    /// publishability when a proven tariff exists.
+    ///
+    /// `allow_archive` is false for the eroded candidates the suffix stripper
+    /// invents: substituting there would swap a live row for a DIFFERENT
+    /// model's archived tariff (`mimo-v2.5-pro` billed as `mimo/mimo-v2.5`).
+    fn prefer_proven_archive(
+        &self,
+        upstream: LookupResult,
+        model_id: &str,
+        provider_id: Option<&str>,
+        allow_archive: bool,
+    ) -> LookupResult {
+        if !allow_archive || upstream.evidence.is_submission_safe() {
+            return upstream;
+        }
+        self.exact_match_archive(model_id, provider_id)
+            .filter(|archived| archived.evidence.is_submission_safe())
+            .unwrap_or(upstream)
+    }
+
+    /// Match `model_id` against the retirement archive of last-known tariffs.
+    ///
+    /// Unlike the Cursor and Sakana built-ins above, this does NOT stamp
+    /// `BuiltIn`. `BuiltIn` is unconditionally submission-safe, and an archived
+    /// rate is a snapshot rather than a live quote: it earns provider-scoped
+    /// evidence only when the lookup proves the endpoint that published it, and
+    /// otherwise stays an estimate.
+    fn exact_match_archive(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if self.archive.is_empty() {
+            return None;
+        }
+
+        // Every archived key is a canonical `{family}-{major}-{minor}` id
+        // under a provider root, so the normalizer the upstream exact passes
+        // already use is the whole matcher for the Claude line: it folds the
+        // dated (`claude-haiku-4-5-20251001`), context-tagged
+        // (`claude-opus-4-8[1m]`), dotted (`claude-haiku-4.5`) and
+        // reasoning-tier (`claude-opus-4-7-thinking-xhigh`) spellings real
+        // clients emit, and it drops any leading provider segment on the way.
+        // Comparing the raw id to the key by equality instead would miss
+        // every one of those shapes -- that is, every shape the archive
+        // exists to cover. Ids from other vendors have no normalizer yet and
+        // match verbatim; the provider-qualified gate below still requires
+        // the hint to name the key's publishing endpoint, so a verbatim
+        // match can never elect a neighbouring model.
+        let lower = model_id.trim().to_ascii_lowercase();
+        let stripped = lower
+            .split_once('/')
+            .map_or(lower.as_str(), |(_, model)| model);
+        let canonical = normalize_model_name(&lower)
+            .or_else(|| normalize_model_name(stripped))
+            .unwrap_or_else(|| stripped.to_string());
+
+        // The id's own leading segment authorises the tariff exactly as a hint
+        // does, so `anthropic/claude-opus-4-8` resolves provider-scoped with no
+        // hint at all, while `openrouter/anthropic/claude-haiku-4.5` roots on
+        // the reseller and is refused here. (The outer resolver then peels the
+        // unknown vendor prefix and retries the bare id, which lands in the
+        // unhinted branch below and is priced as an estimate, never
+        // submission-safe.) An explicit hint wins over the id, matching every
+        // other resolver.
+        let embedded_root = lower.split_once('/').map(|(root, _)| root);
+        let hint = provider_id.or(embedded_root);
+
+        let result = match hint {
+            Some(hint) => exact_match_with_provider_prefixes(
+                &canonical,
+                Some(hint),
+                &self.archive_key_parts,
+                &self.archive,
+                ARCHIVE_SOURCE,
+            )?,
+            // Nothing here names the publishing endpoint, so this is the same
+            // estimate-only evidence an unhinted cross-provider fallback gets:
+            // priced for display, never submission-safe.
+            None => {
+                let matches: Vec<&String> = self
+                    .archive_key_parts
+                    .iter()
+                    .filter(|kp| model_part_matches_exact(&kp.lower_model_part, &canonical))
+                    .map(|kp| &kp.key)
+                    .collect();
+                select_best_match(
+                    &matches,
+                    &self.archive,
+                    ARCHIVE_SOURCE,
+                    None,
+                    ResolutionKind::ModelPart,
+                    &canonical,
+                )?
+            }
+        };
+
+        // The matched key is never the requested id verbatim, so disclose the
+        // normalization the way every other normalized pass does.
+        Some(result.with_normalization())
     }
 
     fn prefix_match_litellm(
@@ -1004,7 +1696,7 @@ impl PricingLookup {
             if let Some(litellm_key) = self.litellm_lower.get(&key) {
                 if let Some(pricing) = self.litellm.get(litellm_key) {
                     if let Some(result) = lookup_result_if_usable(pricing, "LiteLLM", litellm_key) {
-                        return Some(result);
+                        return Some(result.with_kind(ResolutionKind::ProviderPrefix));
                     }
                 }
             }
@@ -1026,7 +1718,7 @@ impl PricingLookup {
             if let Some(or_key) = self.openrouter_lower.get(&key) {
                 if let Some(pricing) = self.openrouter.get(or_key) {
                     if let Some(result) = lookup_result_if_usable(pricing, "OpenRouter", or_key) {
-                        return Some(result);
+                        return Some(result.with_kind(ResolutionKind::ProviderPrefix));
                     }
                 }
             }
@@ -1051,6 +1743,7 @@ impl PricingLookup {
                         pricing: pricing.clone(),
                         source: "Models.dev".into(),
                         matched_key: models_dev_key.clone(),
+                        evidence: ResolutionEvidence::deterministic(ResolutionKind::ProviderPrefix),
                     });
                 }
             }
@@ -1073,9 +1766,14 @@ impl PricingLookup {
             }
         }
 
-        if let Some(result) =
-            select_best_match(&family_matches_list, &self.litellm, "LiteLLM", provider_id)
-        {
+        if let Some(result) = select_best_match(
+            &family_matches_list,
+            &self.litellm,
+            "LiteLLM",
+            provider_id,
+            ResolutionKind::Fuzzy,
+            model_id,
+        ) {
             return Some(result);
         }
 
@@ -1087,10 +1785,39 @@ impl PricingLookup {
             }
         }
 
-        select_best_match(&all_matches, &self.litellm, "LiteLLM", provider_id)
+        select_best_match(
+            &all_matches,
+            &self.litellm,
+            "LiteLLM",
+            provider_id,
+            ResolutionKind::Fuzzy,
+            model_id,
+        )
     }
 
     fn fuzzy_match_openrouter(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.fuzzy_match_openrouter_spelling(model_id, provider_id) {
+            return Some(result);
+        }
+        // OpenRouter spells some minor versions with a dot where LiteLLM and
+        // callers hyphenate (`anthropic/claude-haiku-4.5` vs
+        // `claude-haiku-4-5`), and `contains_model_id` is a literal find, so
+        // the pass above never sees those keys. Retry the same fuzzy passes
+        // against the normalized spelling before giving up, the way the exact
+        // passes already do (#1329).
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            return self
+                .fuzzy_match_openrouter_spelling(&version_normalized, provider_id)
+                .map(|result| result.with_normalization());
+        }
+        None
+    }
+
+    fn fuzzy_match_openrouter_spelling(
         &self,
         model_id: &str,
         provider_id: Option<&str>,
@@ -1111,6 +1838,8 @@ impl PricingLookup {
             &self.openrouter,
             "OpenRouter",
             provider_id,
+            ResolutionKind::Fuzzy,
+            model_id,
         ) {
             return Some(result);
         }
@@ -1124,7 +1853,14 @@ impl PricingLookup {
             }
         }
 
-        select_best_match(&all_matches, &self.openrouter, "OpenRouter", provider_id)
+        select_best_match(
+            &all_matches,
+            &self.openrouter,
+            "OpenRouter",
+            provider_id,
+            ResolutionKind::Fuzzy,
+            model_id,
+        )
     }
 
     pub fn calculate_cost(
@@ -1152,20 +1888,393 @@ impl PricingLookup {
         provider_id: Option<&str>,
         usage: &TokenBreakdown,
     ) -> f64 {
-        let result = match self.lookup_with_provider(model_id, provider_id) {
+        let provider_id = normalize_provider_hint(provider_id);
+        let result = match self.resolve_for_usage(model_id, provider_id, usage) {
             Some(r) => r,
             None => return 0.0,
         };
 
+        compute_cost_for_lookup(&result, provider_id, usage)
+    }
+
+    /// Resolve `model_id` for pricing `usage`, borrowing the rates the
+    /// provider-hinted row omits from the canonical unhinted row.
+    ///
+    /// A provider hint can steer resolution onto a gateway or reseller key
+    /// that lists input and output rates only — OpenRouter's
+    /// `openai/gpt-5.2-codex` and LiteLLM's `gmi/google/gemini-3-pro-preview`
+    /// both do — while the canonical key for the same model publishes the
+    /// cache rates as well. Pricing the hinted row alone bills cached tokens
+    /// at zero and makes `covers_usage` false, which aborted whole
+    /// submissions for every Codex session (#1013).
+    ///
+    /// Only buckets the hinted row cannot price are filled, so a reseller row
+    /// keeps its own markup rather than silently repricing to the author's
+    /// cheaper rate. If the filled row still cannot cover the usage, the
+    /// hinted row is returned unchanged and the usage stays unpriced.
+    pub(super) fn resolve_for_usage(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> Option<LookupResult> {
+        let hinted = self.lookup_with_provider(model_id, provider_id)?;
+        if normalize_provider_hint(provider_id).is_none() || hinted.pricing.covers_usage(usage) {
+            return Some(hinted);
+        }
+
+        let Some(canonical) = self.lookup_with_provider(model_id, None) else {
+            return Some(hinted);
+        };
+        if canonical.matched_key == hinted.matched_key
+            || !quote_same_base_rates(&hinted.pricing, &canonical.pricing)
+        {
+            return Some(hinted);
+        }
+
+        let filled = hinted
+            .pricing
+            .with_missing_rates_from(&canonical.pricing, usage);
+        if !filled.covers_usage(usage) {
+            return Some(hinted);
+        }
+
+        // Keep the hinted row's source and matched key: `compute_cost_for_lookup`
+        // branches on both for OpenAI's full-request 272k tiering, so borrowing
+        // rates must not change which pricing model applies. The evidence is
+        // composed rather than kept, because the filled row now quotes the
+        // canonical row's rates and has to be judged on the weaker of the two
+        // resolutions. The estimate stays visible either way; only its
+        // publishability changes.
+        let evidence = hinted.evidence.borrowing_from(&canonical.evidence);
+        Some(LookupResult {
+            pricing: filled,
+            evidence,
+            ..hinted
+        })
+    }
+}
+
+/// Whether two rows price the same deal, judged on the base rates they both
+/// publish.
+///
+/// Borrowing a rate across rows that disagree would invent a tariff neither
+/// provider charges: `azure_ai/grok-code-fast-1` bills $3.50/$17.50 per
+/// million with no cache-read rate, while the canonical `xai/` row bills
+/// $0.20/$1.50 with one, so an Azure row must never inherit xAI's cache
+/// price. Rows must also agree on at least one bucket — without a single
+/// shared rate there is no evidence they describe the same deal at all.
+fn quote_same_base_rates(hinted: &ModelPricing, canonical: &ModelPricing) -> bool {
+    let mut shared = false;
+
+    for (hinted_rate, canonical_rate) in [
+        (hinted.input_cost_per_token, canonical.input_cost_per_token),
+        (
+            hinted.output_cost_per_token,
+            canonical.output_cost_per_token,
+        ),
+        (
+            hinted.cache_read_input_token_cost,
+            canonical.cache_read_input_token_cost,
+        ),
+        (
+            hinted.cache_creation_input_token_cost,
+            canonical.cache_creation_input_token_cost,
+        ),
+    ] {
+        let (Some(hinted_rate), Some(canonical_rate)) = (hinted_rate, canonical_rate) else {
+            continue;
+        };
+        if !hinted_rate.is_finite() || !canonical_rate.is_finite() {
+            return false;
+        }
+        if (hinted_rate - canonical_rate).abs() > canonical_rate.abs() * 1e-9 {
+            return false;
+        }
+        shared = true;
+    }
+
+    shared
+}
+
+fn matches_model_or_snapshot(model_id: &str, base: &str) -> bool {
+    model_id == base
+        || model_id
+            .strip_prefix(base)
+            .is_some_and(|suffix| suffix.starts_with("-20"))
+}
+
+fn is_openai_full_request_272k_model(model_id: &str) -> bool {
+    let key = model_id.to_ascii_lowercase();
+    let model_id = key.split('/').next_back().unwrap_or(&key);
+
+    [
+        "gpt-5.4",
+        "gpt-5.4-pro",
+        "gpt-5.5",
+        // Priced identically to gpt-5.4-pro in LiteLLM ($30/$180 base,
+        // $60/$270 above 272k) with the same full-request semantics.
+        "gpt-5.5-pro",
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-6-astra",
+    ]
+    .into_iter()
+    .any(|base| matches_model_or_snapshot(model_id, base))
+}
+
+fn should_prefer_openai_tiered_litellm(
+    model_id: &str,
+    provider_id: Option<&str>,
+    litellm: Option<&LookupResult>,
+) -> bool {
+    provider_id.is_some_and(|provider| {
+        provider_identity::canonical_provider(provider).as_deref() == Some("openai")
+    }) && is_openai_full_request_272k_model(model_id)
+        && litellm.is_some_and(|result| has_complete_openai_272k_pricing(&result.pricing))
+}
+
+// A fully-absent cache_read pair used to count as "complete" here (only a
+// present-but-partial pair failed), which let the 272k LiteLLM preference
+// fire over an OpenRouter entry that actually had cache-read pricing,
+// silently dropping it. cache_read is now required present+valid like
+// input/output, symmetric with them, for this preference decision only.
+fn has_complete_openai_272k_pricing(pricing: &ModelPricing) -> bool {
+    has_valid_rate_pair(
+        pricing.input_cost_per_token,
+        pricing.input_cost_per_token_above_272k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.output_cost_per_token,
+        pricing.output_cost_per_token_above_272k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.cache_read_input_token_cost,
+        pricing.cache_read_input_token_cost_above_272k_tokens,
+    )
+}
+
+fn has_valid_rate_pair(base: Option<f64>, above: Option<f64>) -> bool {
+    base.is_some_and(is_valid_price_value) && above.is_some_and(is_valid_price_value)
+}
+
+fn uses_openai_full_request_272k_pricing(result: &LookupResult, provider_id: Option<&str>) -> bool {
+    if result.source != "LiteLLM"
+        || is_reseller_provider(&result.matched_key)
+        || provider_id.is_some_and(|provider| {
+            provider_identity::canonical_provider(provider).as_deref() != Some("openai")
+        })
+    {
+        return false;
+    }
+
+    let key = result.matched_key.to_ascii_lowercase();
+    if key.contains('/') && !key.starts_with("openai/") {
+        return false;
+    }
+
+    is_openai_full_request_272k_model(&key)
+}
+
+/// Whether this is a direct xAI Grok row with the complete 200k tariff that
+/// xAI documents as request-wide.
+///
+/// Keep this deliberately narrower than "anything with an above-200k field":
+/// Google and other vendors use different boundary operators and progressive
+/// tiers, OpenRouter is a separate billing endpoint, and LiteLLM also carries
+/// xAI rows with unverified 128k tiers. The direct xAI 200k rows publish base
+/// and high rates for input, output, and cache reads, matching the vendor's
+/// pricing table: https://docs.x.ai/developers/pricing.
+fn uses_xai_full_request_200k_pricing(result: &LookupResult, provider_id: Option<&str>) -> bool {
+    let provider_id = normalize_provider_hint(provider_id);
+    let hinted_xai = provider_id.is_some_and(|provider| {
+        provider_identity::canonical_provider(provider).as_deref() == Some("xai")
+    });
+    if provider_id.is_some() && !hinted_xai {
+        return false;
+    }
+
+    let key = result.matched_key.trim().to_ascii_lowercase();
+    let mut parts = key.split('/');
+    let identifies_xai_grok = match (parts.next(), parts.next(), parts.next()) {
+        // `xai/grok-*` from the upstream catalog.
+        (Some(provider), Some(model), None) => {
+            result.source == "LiteLLM"
+                && provider_identity::canonical_provider(provider).as_deref() == Some("xai")
+                && model.starts_with("grok-")
+        }
+        // A bare `grok-*` from the built-in Cursor table, which is how that
+        // table keys it. Those rows are transcribed from xAI's own published
+        // tariff -- the same numbers, including the >200K tier -- so billing
+        // them progressively while the upstream row bills request-wide made the
+        // identical request cost half as much depending on which dataset
+        // resolved it. The xAI hint is required, because a bare `grok-*` says
+        // nothing about who billed it.
+        (Some(model), None, None) => {
+            result.source == "Cursor" && hinted_xai && model.starts_with("grok-")
+        }
+        _ => false,
+    };
+    if !identifies_xai_grok {
+        return false;
+    }
+
+    let pricing = &result.pricing;
+    let has_complete_200k_tier = has_valid_rate_pair(
+        pricing.input_cost_per_token,
+        pricing.input_cost_per_token_above_200k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.output_cost_per_token,
+        pricing.output_cost_per_token_above_200k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.cache_read_input_token_cost,
+        pricing.cache_read_input_token_cost_above_200k_tokens,
+    );
+    let has_other_context_tier = [
+        pricing.input_cost_per_token_above_128k_tokens,
+        pricing.input_cost_per_token_above_256k_tokens,
+        pricing.input_cost_per_token_above_272k_tokens,
+        pricing.output_cost_per_token_above_128k_tokens,
+        pricing.output_cost_per_token_above_256k_tokens,
+        pricing.output_cost_per_token_above_272k_tokens,
+        pricing.cache_read_input_token_cost_above_272k_tokens,
+    ]
+    .into_iter()
+    .any(|rate| rate.is_some_and(is_valid_price_value));
+    let has_cache_write_pricing = [
+        pricing.cache_creation_input_token_cost,
+        pricing.cache_creation_input_token_cost_above_200k_tokens,
+    ]
+    .into_iter()
+    .any(|rate| rate.is_some_and(is_valid_price_value));
+
+    has_complete_200k_tier && !has_other_context_tier && !has_cache_write_pricing
+}
+
+fn compute_xai_full_request_200k_cost(result: &LookupResult, usage: &TokenBreakdown) -> f64 {
+    let mut pricing = result.pricing.clone();
+    let prompt_tokens = usage.input.max(0).saturating_add(usage.cache_read.max(0));
+
+    // xAI's boundary is inclusive: a prompt that reaches 200k selects the
+    // high rates for the entire request. Its public usage schema and current
+    // LiteLLM rows publish no separate cache-write bucket, so an unpriced
+    // cache-write value deliberately cannot flip every priced bucket.
+    if prompt_tokens >= TIERED_PRICING_THRESHOLD_200K_TOKENS as i64 {
+        pricing.input_cost_per_token = pricing.input_cost_per_token_above_200k_tokens;
+        pricing.output_cost_per_token = pricing.output_cost_per_token_above_200k_tokens;
+        pricing.cache_read_input_token_cost = pricing.cache_read_input_token_cost_above_200k_tokens;
+    }
+
+    // Tier selection has already happened from the request prompt. Clearing
+    // these prevents `compute_cost` from independently tiering a large input,
+    // output, or cache bucket and from charging only the marginal remainder.
+    pricing.input_cost_per_token_above_200k_tokens = None;
+    pricing.output_cost_per_token_above_200k_tokens = None;
+    pricing.cache_read_input_token_cost_above_200k_tokens = None;
+
+    compute_cost(
+        &pricing,
+        usage.input,
+        usage.output,
+        usage.cache_read,
+        usage.cache_write,
+        usage.reasoning,
+    )
+}
+
+fn compute_cost_for_lookup(
+    result: &LookupResult,
+    provider_id: Option<&str>,
+    usage: &TokenBreakdown,
+) -> f64 {
+    let calculate = |pricing| {
         compute_cost(
-            &result.pricing,
+            pricing,
             usage.input,
             usage.output,
             usage.cache_read,
             usage.cache_write,
             usage.reasoning,
         )
+    };
+    if uses_xai_full_request_200k_pricing(result, provider_id) {
+        return compute_xai_full_request_200k_cost(result, usage);
     }
+
+    let total_input = usage
+        .input
+        .max(0)
+        .saturating_add(usage.cache_read.max(0))
+        .saturating_add(usage.cache_write.max(0));
+    if !uses_openai_full_request_272k_pricing(result, provider_id) {
+        return calculate(&result.pricing);
+    }
+
+    let mut pricing = result.pricing.clone();
+    if total_input <= TIERED_PRICING_THRESHOLD_272K_TOKENS as i64 {
+        pricing.input_cost_per_token_above_272k_tokens = None;
+        pricing.output_cost_per_token_above_272k_tokens = None;
+        pricing.cache_read_input_token_cost_above_272k_tokens = None;
+        return calculate(&pricing);
+    }
+
+    if let Some(high) = pricing
+        .input_cost_per_token_above_272k_tokens
+        .filter(|price| is_valid_price_value(*price))
+    {
+        let input_multiplier = pricing
+            .input_cost_per_token
+            .filter(|base| is_valid_price_value(*base) && *base > 0.0)
+            .map(|base| high / base);
+        for rate in [
+            &mut pricing.input_cost_per_token,
+            &mut pricing.input_cost_per_token_above_128k_tokens,
+            &mut pricing.input_cost_per_token_above_200k_tokens,
+            &mut pricing.input_cost_per_token_above_256k_tokens,
+            &mut pricing.input_cost_per_token_above_272k_tokens,
+        ] {
+            *rate = Some(high);
+        }
+
+        if let (Some(multiplier), Some(cache_write_price)) = (
+            input_multiplier,
+            pricing
+                .cache_creation_input_token_cost
+                .filter(|price| is_valid_price_value(*price)),
+        ) {
+            let high = Some(cache_write_price * multiplier);
+            pricing.cache_creation_input_token_cost = high;
+            pricing.cache_creation_input_token_cost_above_200k_tokens = high;
+        }
+    }
+    if let Some(high) = pricing
+        .output_cost_per_token_above_272k_tokens
+        .filter(|price| is_valid_price_value(*price))
+    {
+        for rate in [
+            &mut pricing.output_cost_per_token,
+            &mut pricing.output_cost_per_token_above_128k_tokens,
+            &mut pricing.output_cost_per_token_above_200k_tokens,
+            &mut pricing.output_cost_per_token_above_256k_tokens,
+            &mut pricing.output_cost_per_token_above_272k_tokens,
+        ] {
+            *rate = Some(high);
+        }
+    }
+    if let Some(high) = pricing
+        .cache_read_input_token_cost_above_272k_tokens
+        .filter(|price| is_valid_price_value(*price))
+    {
+        for rate in [
+            &mut pricing.cache_read_input_token_cost,
+            &mut pricing.cache_read_input_token_cost_above_200k_tokens,
+            &mut pricing.cache_read_input_token_cost_above_272k_tokens,
+        ] {
+            *rate = Some(high);
+        }
+    }
+
+    calculate(&pricing)
 }
 
 pub fn compute_cost(
@@ -1257,9 +2366,12 @@ pub fn compute_cost(
     // because upstream LiteLLM does not currently declare 128k or 256k
     // cache-read pricing for any model. If upstream begins emitting
     // those keys, also add matching fields to `ModelPricing`,
-    // `has_any_usable_pricing`, `has_any_valid_above_tier_value`, and
-    // `has_meaningful_tier_support`; otherwise tier walks will silently
-    // undercost long-context cache reads on those models.
+    // `has_any_valid_above_tier_value`, and `has_meaningful_tier_support`;
+    // otherwise tier walks will silently undercost long-context cache reads
+    // on those models. `has_any_usable_pricing` and
+    // `quotes_zero_for_every_published_rate` need no entry here: they read
+    // `ModelPricing::all_rates`, whose exhaustive destructure fails to
+    // compile until the new field is added there.
     let cache_read_cost = tiered_cost(
         cache_read_clamped,
         pricing.cache_read_input_token_cost,
@@ -1645,25 +2757,10 @@ fn is_valid_price_value(value: f64) -> bool {
 /// subscription-based providers like Perplexity) are useless for
 /// pay-per-token cost estimation and should be deprioritized.
 fn has_any_usable_pricing(pricing: &ModelPricing) -> bool {
-    [
-        pricing.input_cost_per_token,
-        pricing.output_cost_per_token,
-        pricing.cache_read_input_token_cost,
-        pricing.cache_creation_input_token_cost,
-        pricing.input_cost_per_token_above_128k_tokens,
-        pricing.input_cost_per_token_above_200k_tokens,
-        pricing.input_cost_per_token_above_256k_tokens,
-        pricing.input_cost_per_token_above_272k_tokens,
-        pricing.output_cost_per_token_above_128k_tokens,
-        pricing.output_cost_per_token_above_200k_tokens,
-        pricing.output_cost_per_token_above_256k_tokens,
-        pricing.output_cost_per_token_above_272k_tokens,
-        pricing.cache_read_input_token_cost_above_200k_tokens,
-        pricing.cache_read_input_token_cost_above_272k_tokens,
-        pricing.cache_creation_input_token_cost_above_200k_tokens,
-    ]
-    .into_iter()
-    .any(|opt| opt.is_some_and(is_valid_price_value))
+    pricing
+        .all_rates()
+        .into_iter()
+        .any(|opt| opt.is_some_and(is_valid_price_value))
 }
 
 fn lookup_result_if_usable(
@@ -1675,6 +2772,7 @@ fn lookup_result_if_usable(
         pricing: pricing.clone(),
         source: source.into(),
         matched_key: matched_key.into(),
+        evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
     })
 }
 
@@ -1792,6 +2890,18 @@ fn is_fuzzy_eligible(model_id: &str) -> bool {
 /// Attempts to find a model by progressively stripping trailing segments.
 /// Handles arbitrary suffixes (e.g., "claude-sonnet-4-5-thinking" → "claude-sonnet-4-5").
 /// This replaces the hardcoded TIER_SUFFIXES and FALLBACK_SUFFIXES approach.
+///
+/// Every candidate here is an id nobody published: `mimo-v2.5-pro` is a
+/// different SKU from `mimo-v2.5`. Callers therefore pass a lookup with the
+/// retirement archive held out (`eroded_lookup`) — an archived row is one
+/// model's own last published tariff, not a family price, so answering an
+/// eroded candidate from it would bill an unknown SKU at a neighbouring
+/// model's rate and, under that vendor's hint, stamp it submission-safe. The
+/// live datasets still answer here exactly as they did before the archive
+/// existed. The archived spellings that ARE the same model (dated, dotted,
+/// `[1m]`, reasoning-tier) are folded by the normalizer inside
+/// `exact_match_archive`, so they resolve on the direct pass and never depend
+/// on this fallback.
 fn try_strip_unknown_suffix<F>(model_id: &str, do_lookup: F) -> Option<LookupResult>
 where
     F: Fn(&str) -> Option<LookupResult>,
@@ -1880,9 +2990,18 @@ fn has_unrecognized_claude_four_minor(model_id: &str) -> bool {
 /// Attempts to find a model by progressively stripping leading segments.
 /// Handles arbitrary routing prefixes (e.g., "myplugin-claude-3.5-sonnet" → "claude-3.5-sonnet").
 /// This replaces the hardcoded STRIPPED_PREFIXES approach.
-fn try_strip_unknown_prefix<F>(model_id: &str, do_lookup: F) -> Option<LookupResult>
+///
+/// A prefix candidate is still an id somebody published, only tagged by the
+/// client that emitted it, so `do_lookup` keeps the archive. The composed
+/// suffix pass takes `do_eroded_lookup` for the reason above.
+fn try_strip_unknown_prefix<F, G>(
+    model_id: &str,
+    do_lookup: F,
+    do_eroded_lookup: G,
+) -> Option<LookupResult>
 where
     F: Fn(&str) -> Option<LookupResult>,
+    G: Fn(&str) -> Option<LookupResult>,
 {
     let parts: Vec<&str> = model_id.split('-').collect();
 
@@ -1902,7 +3021,7 @@ where
             }
 
             // Try candidate with suffix stripping
-            if let Some(result) = try_strip_unknown_suffix(&candidate, &do_lookup) {
+            if let Some(result) = try_strip_unknown_suffix(&candidate, &do_eroded_lookup) {
                 return Some(result);
             }
         }
@@ -1917,18 +3036,72 @@ where
 /// race, keeping existing resolutions stable), with lexicographic order
 /// breaking length ties so the result no longer depends on HashMap iteration
 /// order.
+// @keep: the shortest-key fallback is arbitrary and actively harmful; the
+// original-provider preference in front of it is what makes this defensible.
+/// Elect between two dataset keys that share a model part.
+///
+/// Preferring the ORIGINAL provider generalizes what used to be a hardcoded
+/// `anthropic/` special case. The rule it encodes is the same one that
+/// motivated that case: when several vendors publish a key ending in the same
+/// model name, the vendor who made the model is the one whose rates describe
+/// it — a reseller or aggregator row is at best a repackaging.
+///
+/// Length is the last resort and is a coin-flip, not a signal. It is what
+/// elected `morph/auto` ($0.85/$1.55) over three $0.00 router rows for the
+/// model part `auto` (#1062), i.e. the single worst-priced candidate purely
+/// because its key was ten characters. Routing labels no longer reach here at
+/// all, but the same hazard remains for any model part several vendors share,
+/// so prefer adding the real vendor to ORIGINAL_PROVIDER_PREFIXES over
+/// relying on the tie-break to land correctly.
 fn prefers_model_part_key(candidate: &str, existing: &str) -> bool {
     let candidate_lower = candidate.to_lowercase();
     let existing_lower = existing.to_lowercase();
-    let is_anthropic = |key: &str| key.split('/').next() == Some("anthropic");
     match (
-        is_anthropic(&candidate_lower),
-        is_anthropic(&existing_lower),
+        is_original_provider(&candidate_lower),
+        is_original_provider(&existing_lower),
     ) {
         (true, false) => true,
         (false, true) => false,
         _ => (candidate_lower.len(), candidate_lower) < (existing_lower.len(), existing_lower),
     }
+}
+
+// @keep: these look like model names and are not, which is the whole problem.
+/// Model ids that name a ROUTER, not a model.
+///
+/// Cursor, Copilot Desktop, Copilot VS Code, Kiro and Workbuddy all emit a
+/// bare `auto` when the product chose the model on the user's behalf
+/// (`sessions/cursor.rs:356`, `copilot_desktop.rs:123`, `copilot_vscode.rs:110`,
+/// `kiro.rs:1135`, `workbuddy.rs:127`); `agent_review` is a Cursor feature.
+/// Nothing in the session log records which model actually served the
+/// request, so any rate attached to these describes a different model.
+///
+/// Left to the normal chain, `auto` matches by model part against every
+/// dataset key ending in `/auto` and — because ties break on shortest key —
+/// elects `morph/auto` at $0.85/$1.55, an unrelated code-apply vendor. That
+/// is real money billed from a coincidence of spelling (#1062).
+///
+/// BARE ids only. A qualified `morph/auto` is a genuine Morph model and still
+/// resolves. `custom-pricing.json` is consulted before this, so a user who
+/// knows their router's effective rate can still state it.
+const ROUTING_LABELS: &[&str] = &["auto", "agent_review"];
+
+/// Source label reported for a price served from the retirement archive.
+///
+/// Deliberately distinct from the live dataset labels: `tokscale pricing` and
+/// the submission diagnostics print this verbatim, and a reader has to be able
+/// to tell "this rate is a snapshot of a model upstream no longer carries" from
+/// "LiteLLM says so today".
+pub(super) const ARCHIVE_SOURCE: &str = "Tokscale Archive";
+
+pub(crate) fn is_routing_label(model_id: &str) -> bool {
+    let lower = model_id.trim().to_lowercase();
+    ROUTING_LABELS.contains(&lower.as_str())
+}
+
+pub(crate) fn is_unpriced_provider(provider_id: &str) -> bool {
+    let lower = provider_id.trim().to_ascii_lowercase();
+    lower == "unpriced" || lower.starts_with("unpriced:")
 }
 
 fn is_original_provider(key: &str) -> bool {
@@ -1938,6 +3111,93 @@ fn is_original_provider(key: &str) -> bool {
         .any(|prefix| lower.starts_with(prefix))
 }
 
+/// Whether the dataset key's leading segment *is* the hinted vendor, rather
+/// than a reseller that merely nests the vendor deeper in the key.
+///
+/// `poe/novita/kimi-k2.6` and `novita-ai/moonshotai/kimi-k2.6` both carry the
+/// tag `novita`, but only the second is Novita's own row; the first is Poe
+/// reselling it at $0.96/$4.04 per MTok against Novita's $0.80/$3.40.
+fn key_root_matches_hint(key: &str, hint_tags: &[String]) -> bool {
+    let Some(root) = key.split('/').next() else {
+        return false;
+    };
+    provider_identity::provider_tags(root)
+        .iter()
+        .any(|tag| hint_tags.iter().any(|hint| hint == tag))
+}
+
+fn normalized_key_root(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_lowercase()
+        .replace('-', "_")
+}
+
+/// Whether provider-tag folding makes the key root and hint match despite
+/// naming different billing endpoints. The alias keeps fallback rows reachable,
+/// but neither endpoint's root is the other endpoint's own top-level row.
+fn key_root_is_cross_provider_alias(key: &str, provider_id: &str) -> bool {
+    let root = normalized_key_root(key);
+    let hint = normalized_key_root(provider_id);
+
+    let is_claude_endpoint = |value: &str| matches!(value, "anthropic" | "vertex" | "vertex_ai");
+    root != hint && is_claude_endpoint(&root) && is_claude_endpoint(&hint)
+}
+
+// @keep: these roots look like providers and are not, which is the whole point.
+/// Dataset key roots that name a SUBSCRIPTION PLAN, not a billing endpoint.
+///
+/// Models.dev publishes every row under `kimi-for-coding/` with explicit
+/// 0.0/0.0 rates because a Kimi coding subscription is billed by the plan, not
+/// by the token. Rows like these are not a price sheet for anything.
+///
+/// Underscore-normalized to compare with `normalized_key_root`.
+const ZERO_PRICED_SUBSCRIPTION_NAMESPACES: &[&str] = &["kimi_for_coding"];
+
+/// Whether the key is rooted at a subscription namespace whose rows are
+/// published at $0.00, and so cannot prove a billing identity.
+///
+/// Same shape and same reason as `key_root_is_cross_provider_alias`: provider
+/// tag folding makes the root and the hint compare equal even though the root
+/// does not name the hinted billing endpoint. `kimi_for_coding` canonicalizes
+/// to `moonshotai` so a Kimi client's provider hint reaches the real
+/// `moonshotai/*` rates, and that direction of the fold is correct. The
+/// reverse is not: an exact model-part hit on a `kimi-for-coding/*` row says
+/// only that the plan lists the model, so promoting it to `ProviderScoped`
+/// would make `covers_usage` accept the explicit zero buckets and publish real
+/// usage to the leaderboard at $0.00. The row stays reachable as the weaker
+/// estimate it was, carrying `UnverifiedProviderIdentity`.
+///
+/// Unlike the claude-endpoint exception this ignores the hint spelling. A
+/// subscription namespace does not become a billing endpoint because the
+/// client happens to report its provider with the same word.
+///
+/// `pricing::aliases` redirects each known `kimi-for-coding` model id away from
+/// this namespace, but that table is a whitelist extended one id at a time;
+/// this covers the ids nobody has enumerated yet.
+///
+/// Two callers, because refusing the promotion is not the whole rule.
+/// `key_root_matches_provider_hint` keeps a hinted model-part hit from being
+/// upgraded, and `LookupResult::with_subscription_namespace_check` marks
+/// whichever resolution finally wins. Only the second covers a lookup whose id
+/// IS the qualified key: that takes the full-key exact branch, which asks
+/// nothing about a provider and so was handed submission-safe `Exact`
+/// evidence with the promotion guard already in place.
+fn key_root_is_zero_priced_subscription_namespace(key: &str) -> bool {
+    ZERO_PRICED_SUBSCRIPTION_NAMESPACES.contains(&normalized_key_root(key).as_str())
+}
+
+fn key_root_matches_provider_hint(key: &str, provider_id: &str) -> bool {
+    let hint_tags = provider_identity::provider_tags(provider_id);
+    key_root_matches_hint(key, &hint_tags)
+        && !key_root_is_cross_provider_alias(key, provider_id)
+        && !key_root_is_zero_priced_subscription_namespace(key)
+}
+
 fn is_reseller_provider(key: &str) -> bool {
     let lower = key.to_lowercase();
     RESELLER_PROVIDER_PREFIXES
@@ -1945,13 +3205,49 @@ fn is_reseller_provider(key: &str) -> bool {
         .any(|prefix| lower.starts_with(prefix))
 }
 
+fn pricing_rows_equal(left: &ModelPricing, right: &ModelPricing) -> bool {
+    left.all_rates()
+        .into_iter()
+        .zip(right.all_rates())
+        .all(|(left, right)| match (left, right) {
+            (Some(left), Some(right)) => left.to_bits() == right.to_bits(),
+            (None, None) => true,
+            _ => false,
+        })
+}
+
+fn terminal_model_identity(model_id: &str) -> String {
+    model_id
+        .trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id)
+        .to_lowercase()
+}
+
 fn select_best_match(
     matches: &[&String],
     dataset: &HashMap<String, ModelPricing>,
     source: &str,
     provider_id: Option<&str>,
+    kind: ResolutionKind,
+    requested_model_id: &str,
 ) -> Option<LookupResult> {
     if matches.is_empty() {
+        return None;
+    }
+
+    let all_usable_matches: Vec<&String> = matches
+        .iter()
+        .copied()
+        .filter(|key| {
+            dataset
+                .get(key.as_str())
+                .is_some_and(has_any_usable_pricing)
+        })
+        .collect();
+    if all_usable_matches.is_empty() {
         return None;
     }
 
@@ -2004,17 +3300,115 @@ fn select_best_match(
                 .find(|k| is_reseller_provider(k))
                 .or_else(|| candidates.first())
         } else {
-            candidates
-                .iter()
-                .find(|k| is_original_provider(k))
+            // The vendor-spelling fold (`deepseek-ai` -> `deepseek`) widens
+            // this pool: a `deepseek` hint now matches both
+            // `novita/deepseek/<model>` and `cloudflare/@cf/deepseek-ai/<model>`,
+            // two resellers with different price sheets for the same weights.
+            // Nothing below tells them apart, so the winner falls out of key
+            // ordering — which is length-descending over a HashMap's key
+            // iteration, and therefore not even stable between processes for
+            // equal-length keys. `deepseek-r1-distill-qwen-32b` with the
+            // `deepseek` hint that `inferred_provider_from_model` synthesizes
+            // moved off `novita/deepseek/...` at $0.30/$0.30 per MTok onto
+            // `cloudflare/@cf/deepseek-ai/...` at $0.497/$4.881 — a 16x output
+            // rate on the same weights.
+            //
+            // So the pool is ranked explicitly instead of leaning on key
+            // order. The hinted vendor's own top-level row wins first:
+            // `novita-ai/moonshotai/kimi-k2.6` at $0.80/$3.40 is Novita's own,
+            // while `poe/novita/kimi-k2.6` at $0.96/$4.04 spells `novita` in a
+            // nested segment only because Poe is reselling it. Ranking that row
+            // rather than merely detecting it matters, because candidates are
+            // ordered longest key first and the vendor's own row is usually the
+            // shorter one: `vercel_ai_gateway/zai/glm-4.6` at $0.45/$1.80 would
+            // otherwise be billed for a `zai` hint that Z.ai itself publishes
+            // at `zai/glm-4.6`, $0.60/$2.20. A raw Vertex hint similarly keeps
+            // Vertex's hosted row ahead of Anthropic's row, while an Anthropic
+            // hint excludes that cross-provider root alias. A first-party row
+            // is the next tier.
+            //
+            // Then comes a row that spells the vendor exactly as the hint does,
+            // in preference to one that only matches after folding. That row is
+            // taken even when it starts with a reseller prefix, because the
+            // property that matters is the spelling, not the publisher: the
+            // pre-fold match for a `deepseek-ai` hint on `deepseek-r1` is
+            // `together_ai/deepseek-ai/DeepSeek-R1` at $3.00/$7.00, and
+            // discarding it for being a reseller just hands the lookup to
+            // `vercel_ai_gateway/deepseek/deepseek-r1` at $0.55/$2.19 — another
+            // reseller, chosen for being spelled the other way and having a
+            // longer key. Among equally spelled rows a non-reseller still wins.
+            let by_root = candidates.iter().find(|k| {
+                key_root_matches_hint(k, &hint_tags)
+                    && !provider_id.is_some_and(|hint| key_root_is_cross_provider_alias(k, hint))
+                    && !key_root_is_zero_priced_subscription_namespace(k)
+            });
+            let by_spelling = provider_id.and_then(|hint| {
+                let spelled: Vec<&&String> = candidates
+                    .iter()
+                    .filter(|k| provider_identity::matches_provider_spelling(k, hint))
+                    .collect();
+                spelled
+                    .iter()
+                    .copied()
+                    .find(|k| !is_reseller_provider(k))
+                    .or_else(|| spelled.first().copied())
+            });
+            by_root
+                .or_else(|| candidates.iter().find(|k| is_original_provider(k)))
+                .or(by_spelling)
                 .or_else(|| candidates.iter().find(|k| !is_reseller_provider(k)))
                 .or_else(|| candidates.first())
         };
         key.and_then(|k| {
+            // A provider's own top-level row is authoritative for that
+            // endpoint. Nested occurrences of the same provider name are
+            // gateway/reseller offers, not peer answers to the hinted billing
+            // identity. Keep the broader candidate set for every weaker
+            // selection so reseller-only and alias-only ambiguity remains
+            // submission-unsafe. Zero-priced subscription namespaces are also
+            // kept in evidence: their canonical provider alias is what makes
+            // the paid row reachable, but it does not prove that usage was
+            // billed outside the subscription.
+            let evidence_matches: Vec<&String> = if provider_id
+                .is_some_and(|hint| key_root_matches_provider_hint(k, hint))
+                && !all_usable_matches
+                    .iter()
+                    .any(|candidate| key_root_is_zero_priced_subscription_namespace(candidate))
+            {
+                all_usable_matches
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        provider_id
+                            .is_some_and(|hint| key_root_matches_provider_hint(candidate, hint))
+                    })
+                    .collect()
+            } else {
+                all_usable_matches.clone()
+            };
+            let candidate_count = evidence_matches.len();
+            let first_pricing = dataset.get(evidence_matches.first()?.as_str())?;
+            let price_consensus = evidence_matches.iter().skip(1).all(|candidate| {
+                dataset
+                    .get(candidate.as_str())
+                    .is_some_and(|pricing| pricing_rows_equal(first_pricing, pricing))
+            });
+
             dataset.get(k.as_str()).map(|pricing| LookupResult {
                 pricing: pricing.clone(),
                 source: source.into(),
                 matched_key: (*k).clone(),
+                evidence: ResolutionEvidence {
+                    kind,
+                    candidate_count,
+                    price_consensus,
+                    exact_model_identity: terminal_model_identity(requested_model_id)
+                        == terminal_model_identity(k),
+                    alias_applied: false,
+                    normalized: false,
+                    stripped: false,
+                    subscription_namespace: false,
+                },
             })
         })
     };
@@ -2035,6 +3429,22 @@ fn model_prefix_matches_provider(model_id: &str, provider_id: Option<&str>) -> b
         (Some(p), Some(h)) => p == h,
         _ => false,
     }
+}
+
+fn scope_resolution_to_provider(mut result: LookupResult, model_id: &str) -> LookupResult {
+    let Some(scoped) = parse_provider_scoped_model_path(model_id) else {
+        return result;
+    };
+
+    // The scoped path asserts an endpoint, but a canonical-tag alias can still
+    // make its terminal fallback land on another endpoint's root. Preserve the
+    // weaker evidence in that case instead of laundering it as provider-scoped.
+    result.evidence.kind = if key_root_matches_provider_hint(&result.matched_key, scoped.provider) {
+        ResolutionKind::ProviderScoped
+    } else {
+        ResolutionKind::ModelPart
+    };
+    result
 }
 
 fn parse_provider_scoped_model_path(model_id: &str) -> Option<ProviderScopedModelPath<'_>> {
@@ -2084,6 +3494,51 @@ fn normalize_provider_hint(provider_id: Option<&str>) -> Option<&str> {
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"))
 }
 
+/// Strip OpenAI's request-speed mode from the model identity.
+///
+/// Codex records `-fast` on GPT ids when the request used OpenAI's fast mode,
+/// but the mode does not identify a separately priced model. Catalogs can
+/// still contain reseller rows whose literal id ends in `-fast`; applying this
+/// normalization only under an OpenAI provider hint prevents those rows from
+/// displacing OpenAI's base tariff while preserving literal lookups for every
+/// other provider.
+fn normalize_openai_fast_mode(model_id: &str, provider_id: Option<&str>) -> Option<String> {
+    if provider_id
+        .and_then(provider_identity::canonical_provider)
+        .as_deref()
+        != Some("openai")
+    {
+        return None;
+    }
+
+    let (prefix, terminal) = model_id
+        .rsplit_once('/')
+        .map_or((None, model_id), |(prefix, terminal)| {
+            (Some(prefix), terminal)
+        });
+    let base = terminal.strip_suffix("-fast")?;
+    if !base.starts_with("gpt-") || base.len() == "gpt-".len() {
+        return None;
+    }
+
+    Some(match prefix {
+        Some(prefix) => format!("{prefix}/{base}"),
+        None => base.to_string(),
+    })
+}
+
+fn matches_inferred_model_provider(model_id: &str, provider_id: Option<&str>) -> bool {
+    let Some(provider_id) = provider_id else {
+        return false;
+    };
+    let terminal_model_id = model_id.rsplit('/').next().unwrap_or(model_id);
+    let Some(inferred) = provider_identity::inferred_provider_from_model(terminal_model_id) else {
+        return false;
+    };
+    provider_identity::canonical_provider(provider_id)
+        == provider_identity::canonical_provider(inferred)
+}
+
 fn build_lookup_cache_key(model_id: &str, provider_id: Option<&str>) -> String {
     match provider_id {
         Some(provider) if !provider.trim().is_empty() => {
@@ -2128,6 +3583,17 @@ fn choose_best_source_result(
                 return openrouter_result;
             }
 
+            let l_matches_root = provider_id
+                .is_some_and(|hint| key_root_matches_provider_hint(&l.matched_key, hint));
+            let o_matches_root = provider_id
+                .is_some_and(|hint| key_root_matches_provider_hint(&o.matched_key, hint));
+            if l_matches_root && !o_matches_root {
+                return litellm_result;
+            }
+            if o_matches_root && !l_matches_root {
+                return openrouter_result;
+            }
+
             let l_is_original = is_original_provider(&l.matched_key);
             let o_is_original = is_original_provider(&o.matched_key);
             let l_is_reseller = is_reseller_provider(&l.matched_key);
@@ -2154,6 +3620,33 @@ fn choose_best_source_result(
     }
 }
 
+/// Run the normal LiteLLM/OpenRouter arbitration, but let a literal
+/// provider-root match from Models.dev displace an alias-only winner. Models.dev
+/// otherwise remains the long-tail fallback at its established precedence.
+fn choose_best_source_result_with_models_dev(
+    litellm_result: Option<LookupResult>,
+    openrouter_result: Option<LookupResult>,
+    models_dev_result: Option<LookupResult>,
+    provider_id: Option<&str>,
+) -> Option<LookupResult> {
+    let primary = choose_best_source_result(litellm_result, openrouter_result, provider_id);
+    let models_dev_matches_root = models_dev_result.as_ref().is_some_and(|result| {
+        provider_id.is_some_and(|hint| key_root_matches_provider_hint(&result.matched_key, hint))
+    });
+    let primary_is_cross_provider_alias = primary.as_ref().is_some_and(|result| {
+        provider_id.is_some_and(|hint| key_root_is_cross_provider_alias(&result.matched_key, hint))
+    });
+
+    if models_dev_matches_root && primary_is_cross_provider_alias {
+        models_dev_result
+    } else {
+        primary
+    }
+}
+
+/// Resolve an exact model part among keys matched by the provider hint.
+/// Canonical tag aliases keep endpoint-related candidates reachable for
+/// estimates, but only a raw root match is provider-scoped evidence.
 fn exact_match_with_provider_prefixes(
     model_id: &str,
     provider_id: Option<&str>,
@@ -2177,7 +3670,25 @@ fn exact_match_with_provider_prefixes(
         return None;
     }
 
-    select_best_match(&matches, dataset, source, Some(provider_id))
+    let result = select_best_match(
+        &matches,
+        dataset,
+        source,
+        Some(provider_id),
+        ResolutionKind::ModelPart,
+        model_id,
+    )?;
+
+    // Canonical provider tags deliberately keep endpoint aliases reachable for
+    // estimates (notably `anthropic` <-> `vertex_ai`). Only a candidate whose
+    // top-level endpoint actually matches the hint proves provider identity.
+    // Otherwise this remains the same estimate-only ModelPart evidence as an
+    // unhinted cross-provider fallback.
+    if key_root_matches_provider_hint(&result.matched_key, provider_id) {
+        Some(result.with_kind(ResolutionKind::ProviderScoped))
+    } else {
+        Some(result)
+    }
 }
 
 #[cfg(test)]
@@ -3012,6 +4523,171 @@ mod tests {
         );
     }
 
+    // Regression: `gemini-default` is a generic routing label — it names which
+    // router served the request, never which model did — so it must stay
+    // unpriced and be submitted at zero with incomplete-cost provenance. Its
+    // fuzzy-eligible remnant
+    // after prefix stripping is the bare word `default`, which substring-hits
+    // LiteLLM's real `fireworks-ai-default` row.
+    //
+    // That row is priced 0.0/0.0, and `covers_usage` counts an explicit zero as
+    // a real rate, so before `default` joined the FUZZY_BLOCKLIST the label
+    // looked priced and `prepare_submission_pricing` let it
+    // through as complete — a Google routing label submitted at Fireworks AI's
+    // rates instead of an explicit unknown cost.
+    // Verified against the live LiteLLM dataset: `fireworks-ai-default` is a
+    // real key with input and output cost 0.0.
+    #[test]
+    fn fuzzy_match_does_not_resolve_generic_default_token() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fireworks-ai-default".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        // The bare token must not resolve.
+        assert!(lookup.lookup("default").is_none());
+        // Nor the routing label that strips down to it, with or without the
+        // provider hint the submission path passes.
+        assert!(lookup.lookup("gemini-default").is_none());
+        assert!(lookup
+            .lookup_with_provider("gemini-default", Some("google"))
+            .is_none());
+
+        // But an EXACT key match is still honored — `fireworks-ai-default` is a
+        // real id in the dataset, not a fuzzy remnant.
+        assert_eq!(
+            lookup.lookup("fireworks-ai-default").unwrap().matched_key,
+            "fireworks-ai-default"
+        );
+    }
+
+    // The blocklist is consulted with the *query* remnant, so blocking
+    // `default` must not stop a query from matching INTO a dataset key that
+    // merely ends in `@default`. LiteLLM ships seven of those
+    // (`vertex_ai/claude-*@default`), and they are ordinary priced models.
+    #[test]
+    fn blocking_the_default_token_still_matches_vertex_default_suffixed_keys() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "vertex_ai/claude-opus-4-7@default".into(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-06),
+                output_cost_per_token: Some(2.5e-05),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        assert_eq!(
+            lookup
+                .lookup("vertex_ai/claude-opus-4-7@default")
+                .unwrap()
+                .matched_key,
+            "vertex_ai/claude-opus-4-7@default"
+        );
+        assert_eq!(
+            lookup
+                .lookup("claude-opus-4-7@default")
+                .unwrap()
+                .matched_key,
+            "vertex_ai/claude-opus-4-7@default"
+        );
+    }
+
+    // Defense-in-depth beyond #1070: the resolver-top `is_routing_label`
+    // guard refuses the router labels parsers emit today (`auto`,
+    // `agent_review`), but the model-part index is a second, deeper place a
+    // bare id can elect another provider's row. Any provider may publish a
+    // generic `FUZZY_BLOCKLIST` token as a model part (`default`, `router`,
+    // `mini`, ...) — none do today, but a bare id carrying such a token names
+    // no model, so it must not land on whatever unrelated key shares the
+    // spelling. This guard covers shapes the label list does not enumerate;
+    // full dataset keys still resolve.
+    #[test]
+    fn model_part_index_does_not_resolve_bare_generic_tokens() {
+        let mut models_dev = HashMap::new();
+        models_dev.insert(
+            "someprovider/router".into(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        );
+        models_dev.insert(
+            "someprovider/default".into(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        // A bare generic token must not resolve through another provider's
+        // model part.
+        assert!(lookup.lookup("router").is_none());
+        assert!(lookup.lookup("default").is_none());
+
+        // The tokens' own full dataset keys are still exact matches.
+        assert_eq!(
+            lookup.lookup("someprovider/router").unwrap().matched_key,
+            "someprovider/router"
+        );
+        assert_eq!(
+            lookup.lookup("someprovider/default").unwrap().matched_key,
+            "someprovider/default"
+        );
+    }
+
+    #[test]
+    fn incomplete_unhinted_result_does_not_replace_provider_pricing() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "azure/gpt-fallback-guard".into(),
+            ModelPricing {
+                input_cost_per_token: Some(1.0),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "gpt-fallback-guard".into(),
+            ModelPricing {
+                output_cost_per_token: Some(2.0),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        // Neither row covers both populated buckets, and they share no base
+        // bucket that would show they price the same deal, so no rate is
+        // borrowed. Retain the provider row rather than replacing it with an
+        // unhinted row that silently prices the input bucket at zero.
+        assert_eq!(
+            lookup.calculate_cost_with_provider("gpt-fallback-guard", Some("azure"), &usage),
+            1.0
+        );
+    }
+
     #[test]
     fn test_provider_hint_normalizes_openai_codex_alias() {
         let mut litellm = HashMap::new();
@@ -3136,6 +4812,8 @@ mod tests {
             "fireworks_ai/accounts/fireworks/models/deepseek-v4-pro"
         );
         assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.evidence.kind, ResolutionKind::ProviderScoped);
+        assert!(result.evidence.is_submission_safe());
     }
 
     #[test]
@@ -3157,6 +4835,8 @@ mod tests {
 
         assert_eq!(result.matched_key, "fireworks_ai/deepseek-v4-pro");
         assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.evidence.kind, ResolutionKind::ProviderScoped);
+        assert!(result.evidence.is_submission_safe());
     }
 
     #[test]
@@ -3215,6 +4895,402 @@ mod tests {
         let result = lookup.lookup("glm-4.7").unwrap();
         assert_eq!(result.matched_key, "z-ai/glm-4.7");
         assert_eq!(result.source, "OpenRouter");
+    }
+
+    /// A bare model id only proves the terminal model spelling. Resolving it to
+    /// another provider's qualified catalog row remains useful as an estimate,
+    /// but must not authorize publishing that provider's price.
+    #[test]
+    fn cross_provider_model_part_remains_visible_but_is_not_submission_safe() {
+        let openrouter = HashMap::from([(
+            "vendor/atlas-chat".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+
+        let result = lookup
+            .lookup("atlas-chat")
+            .expect("reporting should retain the model-part estimate");
+
+        assert_eq!(result.matched_key, "vendor/atlas-chat");
+        assert_eq!(result.evidence.kind, ResolutionKind::ModelPart);
+        assert!(result.evidence.exact_model_identity);
+        assert_eq!(
+            result.evidence.submission_safety_gap(),
+            Some(SubmissionSafetyGap::UnverifiedProviderIdentity)
+        );
+        assert!(!result.evidence.is_submission_safe());
+    }
+
+    #[test]
+    fn inferred_model_vendor_does_not_verify_a_reseller_pricing_row() {
+        let models_dev = HashMap::from([(
+            "venice/gpt-5.4".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup_with_provider("gpt-5.4", Some("openai"))
+            .expect("the reseller price remains available as an estimate");
+
+        assert_eq!(result.matched_key, "venice/gpt-5.4");
+        assert_eq!(result.evidence.kind, ResolutionKind::ModelPart);
+        assert_eq!(
+            result.evidence.submission_safety_gap(),
+            Some(SubmissionSafetyGap::UnverifiedProviderIdentity)
+        );
+    }
+
+    #[test]
+    fn forced_source_does_not_return_builtin_self_hosted_pricing() {
+        let lookup = PricingLookup::new(HashMap::new(), HashMap::new(), HashMap::new());
+
+        assert!(lookup
+            .lookup_with_source_and_provider("local-model", Some("litellm"), Some("llama.cpp"),)
+            .is_none());
+    }
+
+    #[test]
+    fn ordinary_aliases_preserve_upstream_precedence_over_cursor_overrides() {
+        let cursor = HashMap::from([(
+            "kimi-k3".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(9e-6),
+                output_cost_per_token: Some(18e-6),
+                ..Default::default()
+            },
+        )]);
+        let models_dev = HashMap::from([(
+            "moonshotai/kimi-k3".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            cursor,
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup.lookup("k3").expect("the Kimi alias must price");
+
+        assert_eq!(result.source, "Models.dev");
+        assert_eq!(result.matched_key, "moonshotai/kimi-k3");
+    }
+
+    #[test]
+    fn hinted_kimi_k3_selects_the_real_moonshotai_row_with_provider_scoped_evidence() {
+        // models.dev carries the `kimi-for-coding/*` subscription namespace at
+        // $0.00 alongside the real `moonshotai/kimi-k3` row. A Kimi client
+        // reporting model `k3` with a kimi/moonshot provider hint must price
+        // at the real moonshotai rates with provider-scoped evidence instead
+        // of landing on the zero-priced subscription row.
+        let models_dev = HashMap::from([
+            (
+                "kimi-for-coding/k3".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "moonshotai/kimi-k3".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        for hint in ["kimi_for_coding", "moonshot"] {
+            let result = lookup
+                .lookup_with_provider("k3", Some(hint))
+                .expect("the hinted Kimi alias must price");
+
+            assert_eq!(result.source, "Models.dev", "hint: {hint}");
+            assert_eq!(result.matched_key, "moonshotai/kimi-k3", "hint: {hint}");
+            assert_eq!(
+                result.evidence.kind,
+                ResolutionKind::ProviderScoped,
+                "hint: {hint}"
+            );
+            assert!(result.evidence.alias_applied, "hint: {hint}");
+            assert!(result.evidence.is_submission_safe(), "hint: {hint}");
+        }
+    }
+
+    /// `pricing::aliases` redirects every `kimi-for-coding` model id anybody has
+    /// noticed so far onto a real `moonshotai/*` row, so the zero-priced
+    /// subscription namespace is normally never reached. That whitelist is the
+    /// only thing standing between an id nobody has enumerated yet and a
+    /// leaderboard submission at $0.00: an exact model-part hit on a
+    /// `kimi-for-coding/*` row must stay the estimate it is, while the same
+    /// hint against Moonshot's own row still verifies.
+    #[test]
+    fn kimi_subscription_namespace_row_is_not_provider_scoped_evidence() {
+        let models_dev = HashMap::from([
+            (
+                "kimi-for-coding/k3-flash".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "moonshotai/k3-pro".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        for hint in ["kimi_for_coding", "kimi-for-coding", "moonshot"] {
+            let subscription = lookup
+                .lookup_with_provider("k3-flash", Some(hint))
+                .expect("the subscription row stays reachable as an estimate");
+            assert_eq!(
+                subscription.matched_key, "kimi-for-coding/k3-flash",
+                "hint: {hint}"
+            );
+            assert_eq!(
+                subscription.evidence.kind,
+                ResolutionKind::ModelPart,
+                "hint: {hint}"
+            );
+            assert_eq!(
+                subscription.evidence.submission_safety_gap(),
+                Some(SubmissionSafetyGap::UnverifiedProviderIdentity),
+                "hint: {hint}"
+            );
+            assert!(!subscription.evidence.is_submission_safe(), "hint: {hint}");
+
+            let moonshot = lookup
+                .lookup_with_provider("k3-pro", Some(hint))
+                .expect("Moonshot's own row must still price");
+            assert_eq!(moonshot.matched_key, "moonshotai/k3-pro", "hint: {hint}");
+            assert_eq!(
+                moonshot.evidence.kind,
+                ResolutionKind::ProviderScoped,
+                "hint: {hint}"
+            );
+            assert!(moonshot.evidence.is_submission_safe(), "hint: {hint}");
+        }
+    }
+
+    /// When a model part exists in both places, the zero-priced subscription
+    /// row must also lose the candidate ranking, not merely the evidence
+    /// upgrade. Otherwise the reported cost for real usage is still $0.00; the
+    /// row is only kept out of the leaderboard.
+    #[test]
+    fn real_moonshot_row_outranks_the_zero_priced_subscription_row() {
+        let models_dev = HashMap::from([
+            (
+                "kimi-for-coding/k3-flash".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "moonshotai/k3-flash".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        for hint in ["kimi_for_coding", "kimi-for-coding", "moonshot"] {
+            let result = lookup
+                .lookup_with_provider("k3-flash", Some(hint))
+                .expect("the hinted lookup must price");
+            assert_eq!(result.matched_key, "moonshotai/k3-flash", "hint: {hint}");
+            assert_eq!(
+                result.pricing.input_cost_per_token,
+                Some(1e-6),
+                "hint: {hint}"
+            );
+            // The two rows publish different rates, so the selected row is a
+            // reported estimate rather than a publishable price.
+            assert_eq!(
+                result.evidence.submission_safety_gap(),
+                Some(SubmissionSafetyGap::PriceDisagreement),
+                "hint: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_specific_aliases_explicitly_select_cursor_pricing() {
+        let cursor = HashMap::from([(
+            "grok-4.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(2e-6),
+                output_cost_per_token: Some(6e-6),
+                ..Default::default()
+            },
+        )]);
+        let models_dev = HashMap::from([(
+            "xai/grok-4.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(3e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            cursor,
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup("cursor-grok-4.6-high")
+            .expect("the Cursor tier alias must price");
+
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "grok-4.6");
+    }
+
+    #[test]
+    fn unhinted_provider_prefix_remains_visible_but_is_not_submission_safe() {
+        let litellm = HashMap::from([(
+            "anthropic/atlas-chat".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("atlas-chat", Some("synthetic"))
+            .expect("reporting should retain the provider-prefix estimate");
+
+        assert_eq!(result.matched_key, "anthropic/atlas-chat");
+        assert_eq!(result.evidence.kind, ResolutionKind::ProviderPrefix);
+        assert_eq!(
+            result.evidence.submission_safety_gap(),
+            Some(SubmissionSafetyGap::UnverifiedProviderIdentity)
+        );
+        assert!(!result.evidence.is_submission_safe());
+    }
+
+    #[test]
+    fn provider_hint_alias_does_not_verify_another_endpoint_root() {
+        let litellm = HashMap::from([(
+            "vertex_ai/atlas-chat".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let anthropic = lookup
+            .lookup_with_provider("atlas-chat", Some("anthropic"))
+            .expect("the Vertex alias remains available as an estimate");
+        assert_eq!(anthropic.matched_key, "vertex_ai/atlas-chat");
+        assert_eq!(anthropic.evidence.kind, ResolutionKind::ModelPart);
+        assert!(!anthropic.evidence.is_submission_safe());
+
+        let vertex = lookup
+            .lookup_with_provider("atlas-chat", Some("vertex_ai"))
+            .expect("the literal Vertex endpoint should resolve");
+        assert_eq!(vertex.matched_key, "vertex_ai/atlas-chat");
+        assert_eq!(vertex.evidence.kind, ResolutionKind::ProviderScoped);
+        assert!(vertex.evidence.is_submission_safe());
+    }
+
+    #[test]
+    fn scoped_provider_path_does_not_verify_another_endpoint_root() {
+        let vertex_row = ModelPricing {
+            input_cost_per_token: Some(1e-6),
+            output_cost_per_token: Some(2e-6),
+            ..Default::default()
+        };
+        let litellm = HashMap::from([
+            ("vertex_ai/atlas-chat".to_string(), vertex_row.clone()),
+            (
+                "vertex_ai/accounts/anthropic/models/atlas-chat".to_string(),
+                vertex_row.clone(),
+            ),
+        ]);
+        let openrouter = HashMap::from([(
+            "vertex_ai/accounts/anthropic/models/atlas-chat".to_string(),
+            vertex_row,
+        )]);
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        for source in [None, Some("litellm"), Some("openrouter")] {
+            let result = lookup
+                .lookup_with_source_and_provider(
+                    "accounts/anthropic/models/atlas-chat",
+                    source,
+                    Some("anthropic"),
+                )
+                .unwrap_or_else(|| {
+                    panic!("the {source:?} cross-endpoint row remains available as an estimate")
+                });
+
+            assert_eq!(
+                result.matched_key,
+                "vertex_ai/accounts/anthropic/models/atlas-chat"
+            );
+            assert_eq!(result.evidence.kind, ResolutionKind::ModelPart);
+            assert!(!result.evidence.is_submission_safe());
+        }
     }
 
     #[test]
@@ -3840,6 +5916,33 @@ mod tests {
         );
     }
 
+    /// Regression (#846): an id carrying both a routing prefix and a tier
+    /// suffix resolved to nothing, so real usage billed $0. Each id below
+    /// resolves once one transformation is applied, but the two were never
+    /// applied together: prefix stripping only retried the terminal segment
+    /// as-is, and suffix stripping splits on `-`, so it never shed the `cx/`.
+    #[test]
+    fn test_routing_prefix_and_tier_suffix_strip_together() {
+        let lookup = create_lookup();
+        let expected = lookup.lookup("gpt-5.5").unwrap();
+
+        for id in [
+            "cx/gpt-5.5-xhigh",
+            "cx/gpt-5.5-high",
+            "cx/gpt-5.5-medium",
+            "cx/gpt-5.5-low",
+        ] {
+            let result = lookup
+                .lookup(id)
+                .unwrap_or_else(|| panic!("{id} must resolve"));
+            assert_eq!(result.matched_key, expected.matched_key, "id: {id}");
+            assert_eq!(
+                result.pricing.input_cost_per_token, expected.pricing.input_cost_per_token,
+                "id: {id}"
+            );
+        }
+    }
+
     /// Regression (#831): a dataset key that legitimately keeps its own
     /// provider prefix (e.g. `anthropic/claude-fable-5`, which exists as its
     /// own OpenRouter key) must still resolve via the exact/direct lookup —
@@ -4080,6 +6183,183 @@ mod tests {
         assert_eq!(unhinted.pricing.input_cost_per_token, Some(30e-6));
     }
 
+    /// Regression (#1211): a provider hint can match both the provider's own
+    /// row and gateway rows that merely contain the provider in a nested path.
+    /// Those gateways publish their own markups; they are not conflicting
+    /// answers for the provider's first-party endpoint.
+    #[test]
+    fn provider_root_price_is_not_tainted_by_nested_reseller_rows() {
+        let models_dev = HashMap::from([
+            (
+                "anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(5e-6),
+                    output_cost_per_token: Some(25e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gateway-a/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(7e-6),
+                    output_cost_per_token: Some(35e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gateway-b/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(8e-6),
+                    output_cost_per_token: Some(40e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup_with_provider("claude-opus-4-8", Some("anthropic"))
+            .expect("the first-party Anthropic row should resolve");
+
+        assert_eq!(result.matched_key, "anthropic/claude-opus-4-8");
+        assert_eq!(result.evidence.kind, ResolutionKind::ProviderScoped);
+        assert_eq!(result.evidence.candidate_count, 1);
+        assert!(result.evidence.price_consensus);
+        assert!(result.evidence.is_submission_safe());
+    }
+
+    /// When no first-party root row exists, a provider name embedded in
+    /// multiple reseller paths still cannot establish which tariff applied.
+    #[test]
+    fn nested_reseller_disagreement_remains_submission_unsafe() {
+        let models_dev = HashMap::from([
+            (
+                "gateway-a/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(7e-6),
+                    output_cost_per_token: Some(35e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gateway-b/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(8e-6),
+                    output_cost_per_token: Some(40e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup_with_provider("claude-opus-4-8", Some("anthropic"))
+            .expect("reporting should retain the best available estimate");
+
+        assert_eq!(result.evidence.kind, ResolutionKind::ModelPart);
+        assert_eq!(result.evidence.candidate_count, 2);
+        assert!(!result.evidence.price_consensus);
+        assert!(!result.evidence.is_submission_safe());
+    }
+
+    /// Regression (#1211): Codex's OpenAI `-fast` suffix describes request
+    /// service mode, not a separate model. An OpenAI hint must therefore use
+    /// the base model tariff instead of a reseller's literal `-fast` row.
+    #[test]
+    fn openai_fast_mode_normalizes_to_the_base_model() {
+        let litellm = HashMap::from([(
+            "openai/gpt-5.5".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-6),
+                output_cost_per_token: Some(30e-6),
+                ..Default::default()
+            },
+        )]);
+        let models_dev = HashMap::from([(
+            "vercel/openai/gpt-5.5-fast".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(9e-6),
+                output_cost_per_token: Some(54e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new_with_models_dev(
+            litellm,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        for model_id in ["gpt-5.5-fast", "openai/gpt-5.5-fast"] {
+            let result = lookup
+                .lookup_with_provider(model_id, Some("openai"))
+                .expect("OpenAI fast mode should resolve through the base id");
+            assert_eq!(result.matched_key, "openai/gpt-5.5");
+            assert_eq!(result.pricing.input_cost_per_token, Some(5e-6));
+            assert!(result.evidence.normalized);
+            assert!(result.evidence.is_submission_safe());
+        }
+
+        let reseller = lookup
+            .lookup_with_provider("gpt-5.5-fast", Some("vercel"))
+            .expect("non-OpenAI providers keep literal model identities");
+        assert_eq!(reseller.matched_key, "vercel/openai/gpt-5.5-fast");
+        assert_eq!(reseller.pricing.input_cost_per_token, Some(9e-6));
+        assert!(!reseller.evidence.normalized);
+    }
+
+    /// Regression (#1004 follow-up): a reseller provider hint must select the
+    /// reseller-scoped models.dev row instead of a direct upstream catalog row
+    /// with the same terminal model id.
+    #[test]
+    fn orcarouter_hint_selects_orcarouter_models_dev_row() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "openai/gpt-5.5".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-6),
+                output_cost_per_token: Some(30e-6),
+                ..Default::default()
+            },
+        );
+        let mut models_dev = HashMap::new();
+        models_dev.insert(
+            "orcarouter/openai/gpt-5.5".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(8e-6),
+                output_cost_per_token: Some(48e-6),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            openrouter,
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup_with_provider("gpt-5.5", Some("orcarouter"))
+            .unwrap();
+        assert_eq!(result.source, "Models.dev");
+        assert_eq!(result.matched_key, "orcarouter/openai/gpt-5.5");
+        assert_eq!(result.pricing.input_cost_per_token, Some(8e-6));
+    }
+
     /// Regression (#707 review, cubic follow-up): the provider-hint pin must
     /// also beat the unscoped OpenRouter MODEL-PART fallback, not just the
     /// separator-normalized passes. When the hinted provider's models.dev key
@@ -4124,6 +6404,8 @@ mod tests {
             .unwrap();
         assert_eq!(hinted.matched_key, "venice/claude-opus-4.6-fast");
         assert_eq!(hinted.pricing.input_cost_per_token, Some(36e-6));
+        assert_eq!(hinted.evidence.kind, ResolutionKind::ProviderScoped);
+        assert!(hinted.evidence.is_submission_safe());
 
         // Unhinted dotted lookup keeps the canonical OpenRouter resolution.
         let unhinted = lookup.lookup("claude-opus-4.6-fast").unwrap();
@@ -4345,6 +6627,176 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_resolution_records_conflicting_candidates_as_submission_unsafe() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "vendor-a/atlas-chat-preview".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000002),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "vendor-b/atlas-chat-beta".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000006),
+                ..Default::default()
+            },
+        );
+
+        let result = PricingLookup::new(litellm, HashMap::new(), HashMap::new())
+            .lookup("atlas-chat")
+            .expect("reporting lookup should still expose its estimate");
+
+        assert_eq!(result.evidence.kind, ResolutionKind::Fuzzy);
+        assert_eq!(result.evidence.candidate_count, 2);
+        assert!(!result.evidence.price_consensus);
+        assert!(!result.evidence.exact_model_identity);
+        assert!(!result.evidence.is_submission_safe());
+    }
+
+    #[test]
+    fn fuzzy_resolution_accepts_exact_terminal_identity_with_price_consensus() {
+        let same_price = ModelPricing {
+            input_cost_per_token: Some(0.000001),
+            output_cost_per_token: Some(0.000002),
+            ..Default::default()
+        };
+        let litellm = HashMap::from([
+            ("gateway-a/atlas-chat".into(), same_price.clone()),
+            ("gateway-b/atlas-chat".into(), same_price),
+        ]);
+
+        let result = PricingLookup::new(litellm, HashMap::new(), HashMap::new())
+            .lookup("unknown-router/atlas-chat")
+            .expect("the stripped terminal identity should resolve");
+
+        assert_eq!(result.evidence.kind, ResolutionKind::Fuzzy);
+        assert_eq!(result.evidence.candidate_count, 2);
+        assert!(result.evidence.price_consensus);
+        assert!(result.evidence.exact_model_identity);
+        assert!(result.evidence.stripped);
+        assert!(result.evidence.is_submission_safe());
+    }
+
+    /// A provider-hinted row that resolves deterministically is publishable on
+    /// its own evidence, but the rates it borrows to cover a bucket it does not
+    /// price are only as trustworthy as the row they came from. Filling from an
+    /// ambiguous fuzzy canonical row must not turn that row's price into a
+    /// submitted one.
+    #[test]
+    fn borrowed_rates_from_an_ambiguous_canonical_row_are_not_submission_safe() {
+        let disputed_cache_row = |cache_read: f64| ModelPricing {
+            input_cost_per_token: Some(1e-6),
+            output_cost_per_token: Some(2e-6),
+            cache_read_input_token_cost: Some(cache_read),
+            ..Default::default()
+        };
+        let litellm = HashMap::from([
+            (
+                "azure_ai/atlas-chat".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "vendor-a/atlas-chat-preview".to_string(),
+                disputed_cache_row(5e-7),
+            ),
+            (
+                "vendor-b/atlas-chat-beta".to_string(),
+                disputed_cache_row(9e-7),
+            ),
+        ]);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 100,
+            output: 50,
+            cache_read: 20,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        let hinted = lookup
+            .lookup_with_provider("atlas-chat", Some("azure"))
+            .expect("the provider-hinted row resolves deterministically");
+        assert_eq!(hinted.matched_key, "azure_ai/atlas-chat");
+        assert!(hinted.evidence.is_submission_safe());
+
+        let canonical = lookup
+            .lookup_with_provider("atlas-chat", None)
+            .expect("the unhinted lookup falls back to a fuzzy estimate");
+        assert_eq!(canonical.evidence.kind, ResolutionKind::Fuzzy);
+        assert!(!canonical.evidence.is_submission_safe());
+
+        // The cache-read rate is borrowed from a row the resolver already
+        // refused to publish, and the candidates it was chosen from disagree
+        // about it (5e-7 against 9e-7).
+        let resolved = lookup
+            .resolve_for_usage("atlas-chat", Some("azure"), &usage)
+            .expect("the hinted row still resolves");
+        assert_eq!(resolved.matched_key, "azure_ai/atlas-chat");
+        assert_eq!(resolved.pricing.cache_read_input_token_cost, Some(5e-7));
+        assert!(resolved.pricing.covers_usage(&usage));
+        assert_eq!(
+            resolved.evidence.submission_safety_gap(),
+            Some(SubmissionSafetyGap::PriceDisagreement)
+        );
+        assert!(!resolved.evidence.is_submission_safe());
+
+        // The estimate itself stays visible: this separates estimates from
+        // submissions, it does not stop reporting the cache-read cost.
+        let cost = lookup.calculate_cost_with_provider("atlas-chat", Some("azure"), &usage);
+        assert!((cost - (100.0 * 1e-6 + 50.0 * 2e-6 + 20.0 * 5e-7)).abs() < 1e-12);
+    }
+
+    /// The counterpart to the guard above: when the canonical row is itself
+    /// publishable, borrowing its rate must still produce a submittable price.
+    /// This is the #1013 behaviour the borrow exists for.
+    #[test]
+    fn borrowed_rates_from_a_submission_safe_canonical_row_still_submit() {
+        let litellm = HashMap::from([
+            (
+                "azure_ai/atlas-chat".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "atlas-chat".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    cache_read_input_token_cost: Some(5e-7),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 100,
+            output: 50,
+            cache_read: 20,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        let resolved = lookup
+            .resolve_for_usage("atlas-chat", Some("azure"), &usage)
+            .expect("the hinted row resolves");
+        assert_eq!(resolved.matched_key, "azure_ai/atlas-chat");
+        assert_eq!(resolved.pricing.cache_read_input_token_cost, Some(5e-7));
+        assert!(resolved.evidence.is_submission_safe());
+        assert!(resolved.pricing.covers_usage(&usage));
+    }
+
+    #[test]
     fn test_fallback_suffix_prefers_exact_match() {
         // If the exact model exists, it should be used (no fallback)
         let mut litellm = HashMap::new();
@@ -4535,6 +6987,7 @@ mod tests {
         assert!(is_reseller_provider("vertex_ai/gemini"));
         assert!(is_reseller_provider("together_ai/llama"));
         assert!(is_reseller_provider("groq/llama"));
+        assert!(is_reseller_provider("orcarouter/openai/gpt-4"));
         assert!(!is_reseller_provider("xai/grok"));
         assert!(!is_reseller_provider("anthropic/claude"));
         assert!(!is_reseller_provider("openai/gpt-4"));
@@ -4640,6 +7093,467 @@ mod tests {
             + (28_000.0 * 0.000004);
 
         assert!((cost - expected).abs() < 1e-12);
+    }
+
+    fn openai_272k_result(key: &str, source: &str) -> LookupResult {
+        LookupResult {
+            matched_key: key.into(),
+            source: source.into(),
+            evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+            pricing: ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                input_cost_per_token_above_272k_tokens: Some(0.000010),
+                output_cost_per_token: Some(0.000030),
+                output_cost_per_token_above_272k_tokens: Some(0.000045),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_read_input_token_cost_above_272k_tokens: Some(0.000001),
+                cache_creation_input_token_cost: Some(0.00000625),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn xai_200k_result(key: &str, source: &str) -> LookupResult {
+        LookupResult {
+            matched_key: key.into(),
+            source: source.into(),
+            evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+            pricing: ModelPricing {
+                input_cost_per_token: Some(0.000002),
+                input_cost_per_token_above_200k_tokens: Some(0.000004),
+                output_cost_per_token: Some(0.000006),
+                output_cost_per_token_above_200k_tokens: Some(0.000012),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_read_input_token_cost_above_200k_tokens: Some(0.000001),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn xai_200k_full_request_pricing_is_inclusive_and_prompt_wide() {
+        let result = xai_200k_result("xai/grok-4.6", "LiteLLM");
+
+        let at_boundary = TokenBreakdown {
+            input: 150_000,
+            output: 10_000,
+            cache_read: 50_000,
+            reasoning: 5_000,
+            ..Default::default()
+        };
+        let cost = compute_cost_for_lookup(&result, Some("x-ai"), &at_boundary);
+        let expected = 150_000.0 * 0.000004 + (10_000.0 + 5_000.0) * 0.000012 + 50_000.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+
+        let below_boundary = TokenBreakdown {
+            input: 149_999,
+            ..at_boundary.clone()
+        };
+        let cost = compute_cost_for_lookup(&result, Some("xai"), &below_boundary);
+        let expected =
+            149_999.0 * 0.000002 + (10_000.0 + 5_000.0) * 0.000006 + 50_000.0 * 0.0000005;
+        assert!((cost - expected).abs() < 1e-12);
+
+        // Output volume never selects the tier by itself. With a short prompt,
+        // even an output bucket above 200k remains entirely at the base rate.
+        let output_only = TokenBreakdown {
+            input: 1,
+            output: 250_000,
+            ..Default::default()
+        };
+        let cost = compute_cost_for_lookup(&result, None, &output_only);
+        let expected = 0.000002 + 250_000.0 * 0.000006;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn xai_200k_prompt_threshold_does_not_use_unpriced_cache_write() {
+        let result = xai_200k_result("xai/grok-build-0.1", "LiteLLM");
+        let usage = TokenBreakdown {
+            input: 149_999,
+            output: 1,
+            cache_read: 50_000,
+            cache_write: 1,
+            ..Default::default()
+        };
+
+        let cost = compute_cost_for_lookup(&result, Some("xai"), &usage);
+        let expected = 149_999.0 * 0.000002 + 0.000006 + 50_000.0 * 0.0000005;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn xai_200k_full_request_pricing_scope_is_first_party_and_complete() {
+        for (key, provider) in [
+            ("xai/grok-4.6", None),
+            ("xai/grok-4.6", Some("xai")),
+            ("x-ai/grok-4.6", Some("x-ai")),
+            ("xai/grok-4.6", Some("unknown")),
+        ] {
+            assert!(
+                uses_xai_full_request_200k_pricing(&xai_200k_result(key, "LiteLLM"), provider),
+                "expected direct xAI request-wide pricing for {key} with {provider:?}"
+            );
+        }
+
+        for (key, source, provider) in [
+            ("xai/grok-4.6", "OpenRouter", None),
+            ("xai/grok-4.6", "Models.dev", None),
+            ("xai/grok-4.6", "Cursor", Some("xai")),
+            ("azure_ai/xai/grok-4.6", "LiteLLM", Some("xai")),
+            ("xai/not-grok", "LiteLLM", Some("xai")),
+            ("xai/grok-4.6", "LiteLLM", Some("openrouter")),
+        ] {
+            assert!(
+                !uses_xai_full_request_200k_pricing(&xai_200k_result(key, source), provider),
+                "expected generic pricing for {source}:{key} with {provider:?}"
+            );
+        }
+
+        let mut incomplete = xai_200k_result("xai/grok-4.6", "LiteLLM");
+        incomplete
+            .pricing
+            .cache_read_input_token_cost_above_200k_tokens = None;
+        assert!(!uses_xai_full_request_200k_pricing(
+            &incomplete,
+            Some("xai")
+        ));
+
+        let mut ambiguous = xai_200k_result("xai/grok-4.6", "LiteLLM");
+        ambiguous.pricing.input_cost_per_token_above_128k_tokens = Some(0.000003);
+        assert!(!uses_xai_full_request_200k_pricing(&ambiguous, Some("xai")));
+
+        let mut unverified_cache_write = xai_200k_result("xai/grok-4.6", "LiteLLM");
+        unverified_cache_write
+            .pricing
+            .cache_creation_input_token_cost = Some(0.000002);
+        assert!(!uses_xai_full_request_200k_pricing(
+            &unverified_cache_write,
+            Some("xai")
+        ));
+    }
+
+    #[test]
+    fn xai_128k_only_row_keeps_generic_progressive_pricing() {
+        let result = LookupResult {
+            matched_key: "xai/grok-4-fast".into(),
+            source: "LiteLLM".into(),
+            evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+            pricing: ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                input_cost_per_token_above_128k_tokens: Some(0.000002),
+                output_cost_per_token: Some(0.000003),
+                output_cost_per_token_above_128k_tokens: Some(0.000004),
+                ..Default::default()
+            },
+        };
+        let usage = TokenBreakdown {
+            input: 128_001,
+            output: 1,
+            ..Default::default()
+        };
+
+        let cost = compute_cost_for_lookup(&result, Some("xai"), &usage);
+        let expected = 128_000.0 * 0.000001 + 0.000002 + 0.000003;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_openai_272k_full_request_pricing_uses_combined_input() {
+        let result = openai_272k_result("openai/gpt-5.5", "LiteLLM");
+        let usage = |input, output, cache_read, cache_write| TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning: 0,
+        };
+        let cost =
+            compute_cost_for_lookup(&result, Some("openai"), &usage(200_000, 10_000, 72_000, 1));
+        let expected = 200_000.0 * 0.000010 + 10_000.0 * 0.000045 + 72_000.0 * 0.000001 + 0.0000125;
+        assert!((cost - expected).abs() < 1e-12);
+
+        let boundary = compute_cost_for_lookup(&result, None, &usage(200_000, 10_000, 72_000, 0));
+        let boundary_expected = 200_000.0 * 0.000005 + 10_000.0 * 0.000030 + 72_000.0 * 0.0000005;
+        assert!((boundary - boundary_expected).abs() < 1e-12);
+
+        let output_only = compute_cost_for_lookup(&result, None, &usage(1, 300_000, 0, 0));
+        assert!((output_only - (0.000005 + 300_000.0 * 0.000030)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_provider_aware_openai_prefers_complete_litellm_tiers() {
+        let litellm_pricing = openai_272k_result("gpt-5.6-sol", "LiteLLM").pricing;
+        let openrouter_pricing = ModelPricing {
+            input_cost_per_token: litellm_pricing.input_cost_per_token,
+            output_cost_per_token: litellm_pricing.output_cost_per_token,
+            cache_read_input_token_cost: litellm_pricing.cache_read_input_token_cost,
+            ..Default::default()
+        };
+        let lookup = PricingLookup::new(
+            HashMap::from([("gpt-5.6-sol".into(), litellm_pricing.clone())]),
+            HashMap::from([("openai/gpt-5.6-sol".into(), openrouter_pricing)]),
+            HashMap::new(),
+        );
+
+        let result = lookup
+            .lookup_with_provider("gpt-5.6-sol", Some("openai"))
+            .unwrap();
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "gpt-5.6-sol");
+
+        let usage = TokenBreakdown {
+            input: 200_000,
+            output: 10_000,
+            cache_read: 72_001,
+            ..Default::default()
+        };
+        let expected = 200_000.0 * 0.000010 + 10_000.0 * 0.000045 + 72_001.0 * 0.000001;
+        for provider in [Some("openai"), Some("unknown"), Some(""), None] {
+            let cost = lookup.calculate_cost_with_provider("gpt-5.6-sol", provider, &usage);
+            assert!((cost - expected).abs() < 1e-12);
+        }
+
+        let lookup = PricingLookup::new(
+            HashMap::from([("gpt-5.6-sol".into(), litellm_pricing.clone())]),
+            HashMap::from([("openai/gpt-5.6-sol".into(), litellm_pricing)]),
+            HashMap::new(),
+        );
+        let result = lookup
+            .lookup_with_provider("gpt-5.6-sol", Some("openai"))
+            .unwrap();
+        assert_eq!(result.source, "LiteLLM");
+        assert!(!should_prefer_openai_tiered_litellm(
+            "gpt-5.6-sol",
+            Some("openrouter"),
+            Some(&result)
+        ));
+    }
+
+    #[test]
+    fn test_openai_tiered_litellm_preference_requires_complete_272k_pricing() {
+        let pricing = openai_272k_result("gpt-5.6-sol", "LiteLLM").pricing;
+        assert!(has_complete_openai_272k_pricing(&pricing));
+
+        let clear_required: [fn(&mut ModelPricing); 5] = [
+            |pricing| pricing.input_cost_per_token = None,
+            |pricing| pricing.input_cost_per_token_above_272k_tokens = None,
+            |pricing| pricing.output_cost_per_token = None,
+            |pricing| pricing.output_cost_per_token_above_272k_tokens = None,
+            |pricing| pricing.cache_read_input_token_cost_above_272k_tokens = None,
+        ];
+        for clear in clear_required {
+            let mut incomplete = pricing.clone();
+            clear(&mut incomplete);
+            assert!(!has_complete_openai_272k_pricing(&incomplete));
+        }
+
+        // A fully-absent cache_read pair is now incomplete too: this used to
+        // pass leniently, letting the 272k preference silently drop an
+        // OpenRouter entry's cache-read pricing (see
+        // openai_272k_preference_prefers_openrouter_cache_read_pricing_over_incomplete_litellm).
+        let mut without_cache_read = pricing;
+        without_cache_read.cache_read_input_token_cost = None;
+        without_cache_read.cache_read_input_token_cost_above_272k_tokens = None;
+        assert!(!has_complete_openai_272k_pricing(&without_cache_read));
+    }
+
+    #[test]
+    fn openai_272k_preference_prefers_openrouter_cache_read_pricing_over_incomplete_litellm() {
+        let mut litellm_pricing = openai_272k_result("gpt-5.6-sol", "LiteLLM").pricing;
+        litellm_pricing.cache_read_input_token_cost = None;
+        litellm_pricing.cache_read_input_token_cost_above_272k_tokens = None;
+
+        let openrouter_pricing = openai_272k_result("openai/gpt-5.6-sol", "OpenRouter").pricing;
+
+        let lookup = PricingLookup::new(
+            HashMap::from([("gpt-5.6-sol".into(), litellm_pricing)]),
+            HashMap::from([("openai/gpt-5.6-sol".into(), openrouter_pricing)]),
+            HashMap::new(),
+        );
+
+        let result = lookup
+            .lookup_with_provider("gpt-5.6-sol", Some("openai"))
+            .unwrap();
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "openai/gpt-5.6-sol");
+        assert!(result.pricing.cache_read_input_token_cost.is_some());
+    }
+
+    #[test]
+    fn openai_272k_preference_still_prefers_complete_litellm_pricing() {
+        let litellm_pricing = openai_272k_result("gpt-5.6-sol", "LiteLLM").pricing;
+        let openrouter_pricing = openai_272k_result("openai/gpt-5.6-sol", "OpenRouter").pricing;
+
+        let lookup = PricingLookup::new(
+            HashMap::from([("gpt-5.6-sol".into(), litellm_pricing)]),
+            HashMap::from([("openai/gpt-5.6-sol".into(), openrouter_pricing)]),
+            HashMap::new(),
+        );
+
+        let result = lookup
+            .lookup_with_provider("gpt-5.6-sol", Some("openai"))
+            .unwrap();
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn test_openai_272k_full_request_pricing_scope() {
+        for key in [
+            "gpt-5.4",
+            "openai/gpt-5.4-pro-2026-03-05",
+            "gpt-5.5-2026-04-23",
+            "gpt-5.5-pro",
+            "gpt-5.5-pro-2026-04-23",
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra-2026-07-01",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+            "openai/gpt-6-astra",
+            "gpt-6-astra-2026-09-03",
+        ] {
+            assert!(
+                uses_openai_full_request_272k_pricing(
+                    &openai_272k_result(key, "LiteLLM"),
+                    Some("openai")
+                ),
+                "expected full-request pricing for {key}"
+            );
+        }
+
+        for key in [
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.5-promax",
+            "gpt-5.2",
+            "fugu-ultra",
+            "custom/gpt-5.5-pro",
+        ] {
+            assert!(
+                !uses_openai_full_request_272k_pricing(
+                    &openai_272k_result(key, "LiteLLM"),
+                    Some("openai")
+                ),
+                "expected progressive pricing for {key}"
+            );
+        }
+
+        for (result, provider) in [
+            (openai_272k_result("fugu-ultra", "LiteLLM"), None),
+            (openai_272k_result("openai/gpt-5.5", "OpenRouter"), None),
+            (
+                openai_272k_result("azure/openai/gpt-5.5", "LiteLLM"),
+                Some("azure"),
+            ),
+        ] {
+            assert!(!uses_openai_full_request_272k_pricing(&result, provider));
+        }
+    }
+
+    #[test]
+    fn orcarouter_hint_keeps_litellm_fallback_on_progressive_long_context_pricing() {
+        // OrcaRouter can fall back to LiteLLM's unscoped OpenAI row when its
+        // provider-specific catalog has no match. The provider hint, not an
+        // invented OrcaRouter LiteLLM key, must keep that fallback on normal
+        // progressive tiers instead of applying direct-OpenAI full-request
+        // 272K semantics.
+        let result = openai_272k_result("gpt-5.5", "LiteLLM");
+        let usage = TokenBreakdown {
+            input: 200_000,
+            output: 10_000,
+            cache_read: 72_001,
+            ..Default::default()
+        };
+
+        assert!(uses_openai_full_request_272k_pricing(
+            &result,
+            Some("openai")
+        ));
+        assert!(!uses_openai_full_request_272k_pricing(
+            &result,
+            Some("orcarouter")
+        ));
+
+        let direct_openai_cost = compute_cost_for_lookup(&result, Some("openai"), &usage);
+        let direct_openai_expected =
+            (200_000.0 * 0.000010) + (10_000.0 * 0.000045) + (72_001.0 * 0.000001);
+        assert!((direct_openai_cost - direct_openai_expected).abs() < 1e-12);
+
+        let orcarouter_cost = compute_cost_for_lookup(&result, Some("orcarouter"), &usage);
+        let orcarouter_expected =
+            (200_000.0 * 0.000005) + (10_000.0 * 0.000030) + (72_001.0 * 0.0000005);
+        assert!((orcarouter_cost - orcarouter_expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gpt_6_astra_applies_full_request_pricing_above_272k_threshold() {
+        let result = LookupResult {
+            matched_key: "gpt-6-astra".into(),
+            source: "LiteLLM".into(),
+            evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+            pricing: ModelPricing {
+                input_cost_per_token: Some(0.000010),
+                input_cost_per_token_above_272k_tokens: Some(0.000020),
+                output_cost_per_token: Some(0.000050),
+                output_cost_per_token_above_272k_tokens: Some(0.000075),
+                cache_read_input_token_cost: Some(0.000001),
+                cache_read_input_token_cost_above_272k_tokens: Some(0.000002),
+                cache_creation_input_token_cost: Some(0.0000125),
+                ..Default::default()
+            },
+        };
+
+        let usage = |input, output, cache_read, cache_write| TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning: 0,
+        };
+
+        // 1. Below or at 272k threshold: standard rates
+        let at_boundary =
+            compute_cost_for_lookup(&result, Some("openai"), &usage(272_000, 10_000, 0, 0));
+        let expected_at_boundary = 272_000.0 * 0.000010 + 10_000.0 * 0.000050; // $3.22
+        assert!((at_boundary - expected_at_boundary).abs() < 1e-12);
+
+        // 2. 1 token above threshold: entire request billed at above-272k rates
+        let above_boundary =
+            compute_cost_for_lookup(&result, Some("openai"), &usage(272_001, 10_000, 0, 0));
+        let expected_above_boundary = 272_001.0 * 0.000020 + 10_000.0 * 0.000075; // $6.19002
+        assert!((above_boundary - expected_above_boundary).abs() < 1e-12);
+
+        // 3. 300k uncached input + 10k output: reproduces issue #1279 example
+        let repro_case =
+            compute_cost_for_lookup(&result, Some("openai"), &usage(300_000, 10_000, 0, 0));
+        let expected_repro = 300_000.0 * 0.000020 + 10_000.0 * 0.000075; // $6.75
+        assert!((repro_case - expected_repro).abs() < 1e-12);
+
+        // 4. Combined prompt tokens (250k input + 50k cache read) exceed 272k
+        let cache_case =
+            compute_cost_for_lookup(&result, Some("openai"), &usage(250_000, 10_000, 50_000, 0));
+        let expected_cache = 250_000.0 * 0.000020 + 10_000.0 * 0.000075 + 50_000.0 * 0.000002; // $5.85
+        assert!((cache_case - expected_cache).abs() < 1e-12);
+
+        // 5. Non-direct provider keeps progressive tiers
+        let azure_cost =
+            compute_cost_for_lookup(&result, Some("azure"), &usage(300_000, 10_000, 0, 0));
+        let expected_azure = (272_000.0 * 0.000010 + 28_000.0 * 0.000020) + (10_000.0 * 0.000050); // $3.78
+        assert!((azure_cost - expected_azure).abs() < 1e-12);
+
+        // 6. Complete LiteLLM pricing preference is favored for openai provider
+        assert!(should_prefer_openai_tiered_litellm(
+            "gpt-6-astra",
+            Some("openai"),
+            Some(&result)
+        ));
+        assert!(!should_prefer_openai_tiered_litellm(
+            "gpt-6-astra",
+            Some("azure"),
+            Some(&result)
+        ));
     }
 
     #[test]
@@ -5152,6 +8066,86 @@ mod tests {
     }
 
     #[test]
+    fn test_fuzzy_openrouter_crosses_version_separator_difference() {
+        // OpenRouter keys dot-separated minors (`claude-haiku-4.5`) where the
+        // caller hyphenates (`claude-haiku-4-5`), so a literal `contains`
+        // never pairs them and OpenRouter dropped out of arbitration — with an
+        // `anthropic` hint the reseller LiteLLM entry won and priced cache
+        // writes at zero (#1329).
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "perplexity/anthropic/claude-haiku-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-haiku-4.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                cache_creation_input_token_cost: Some(0.00000125),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        // Provider-hinted: OpenRouter's first-party key must participate and
+        // win arbitration over the hint-matching reseller LiteLLM entry.
+        let result = lookup
+            .lookup_with_provider("claude-haiku-4-5", Some("anthropic"))
+            .expect("normalized OpenRouter entry should participate in arbitration");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5");
+        assert!(result.evidence.normalized);
+
+        // The promoted entry carries the cache-write rate the reseller lacks.
+        let cost = lookup.calculate_cost_with_provider(
+            "claude-haiku-4-5",
+            Some("anthropic"),
+            &TokenBreakdown {
+                input: 1_000,
+                output: 1_000,
+                cache_read: 0,
+                cache_write: 1_000,
+                reasoning: 0,
+            },
+        );
+        assert!(
+            cost > 0.001,
+            "cache writes should price above zero, got {cost}"
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_openrouter_version_separator_without_hint() {
+        // Unhinted lookups hit the same wall: without any LiteLLM entry the
+        // dotted OpenRouter key is the only candidate, and the literal
+        // `contains` hid it entirely.
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-haiku-4.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+        let result = lookup
+            .lookup("claude-haiku-4-5")
+            .expect("fuzzy match should reach the dotted OpenRouter key");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5");
+    }
+
+    #[test]
     fn test_none_pricing_exact_litellm_does_not_shadow_openrouter_model_part() {
         let mut litellm = HashMap::new();
         litellm.insert("claude-opus-4-6".into(), ModelPricing::default());
@@ -5595,5 +8589,674 @@ mod tests {
             r_unknown.matched_key, r_none.matched_key,
             "unknown hint via source_and_provider should behave like None"
         );
+    }
+
+    /// Regression (#1092): equal-length candidate keys must be ordered by the
+    /// index, not by `HashMap` iteration order. This exercises the ordered
+    /// candidate list consumed by `select_best_match` — two litellm keys of the
+    /// same length, no models.dev entries, so the only thing that can decide the
+    /// winner is the tiebreak in the key sort. Without it the lookup returns
+    /// whichever key the hasher happened to yield first, and the reported rate
+    /// flips between $0.01 and $0.02 across processes.
+    #[test]
+    fn test_pricing_index_deterministic_key_sorting_equal_length() {
+        let build = |first: (&str, f64), second: (&str, f64)| {
+            let mut litellm = HashMap::new();
+            for (key, input_cost) in [first, second] {
+                litellm.insert(
+                    key.to_string(),
+                    ModelPricing {
+                        input_cost_per_token: Some(input_cost),
+                        ..Default::default()
+                    },
+                );
+            }
+            PricingLookup::new_with_models_dev(
+                litellm,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
+
+        let east = ("bedrock/us-east-1/zai.glm-5", 0.01);
+        let west = ("bedrock/us-west-2/zai.glm-5", 0.02);
+        assert_eq!(east.0.len(), west.0.len());
+
+        for (order, index) in [build(east, west), build(west, east)].iter().enumerate() {
+            let result = index
+                .lookup_with_provider("zai.glm-5", Some("bedrock"))
+                .unwrap_or_else(|| panic!("insertion order {order} must resolve zai.glm-5"));
+            assert_eq!(
+                result.matched_key, "bedrock/us-east-1/zai.glm-5",
+                "equal-length candidates must resolve to the alphabetically first key regardless of insertion order (order {order})"
+            );
+            assert_eq!(result.pricing.input_cost_per_token, Some(0.01));
+        }
+    }
+
+    /// Regression (#1062): a bare router label must not be priced from a
+    /// coincidence of spelling. `auto` used to elect `morph/auto` at
+    /// $0.85/$1.55 — an unrelated code-apply vendor — and submit at those
+    /// rates, because covers_usage only demands rates for populated buckets.
+    #[test]
+    fn bare_routing_labels_do_not_resolve_but_qualified_ones_do() {
+        let mut models_dev = HashMap::new();
+        for key in ["morph/auto", "llmgateway/auto", "cursor/agent_review"] {
+            models_dev.insert(
+                key.to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(8.5e-7),
+                    output_cost_per_token: Some(1.55e-6),
+                    ..Default::default()
+                },
+            );
+        }
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        // Five parsers emit these bare; nothing records the real model.
+        assert!(lookup.lookup("auto").is_none());
+        assert!(lookup.lookup("AUTO").is_none());
+        assert!(lookup.lookup("agent_review").is_none());
+
+        // A tier suffix does not make it a model: this normalizes to `auto`
+        // before the model-part fallback runs.
+        assert!(lookup.lookup("auto(high)").is_none());
+        // Nor does an unrecognized vendor prefix, which is dropped to retry
+        // the bare id. A real `morph/auto` never reaches that fallback.
+        assert!(lookup.lookup("cx/auto").is_none());
+
+        // A qualified id names a real vendor's model and still prices.
+        assert!(lookup.lookup("morph/auto").is_some());
+    }
+
+    #[test]
+    fn explicitly_unpriced_provider_routes_do_not_inherit_model_pricing() {
+        let litellm = HashMap::from([(
+            "openai/gpt-5.4".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1_000,
+            output: 100,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        assert!(super::is_unpriced_provider("unpriced:custom"));
+        assert!(super::is_unpriced_provider(" UNPRICED "));
+        assert!(!super::is_unpriced_provider("openai"));
+        assert!(lookup
+            .lookup_with_provider("gpt-5.4", Some("unpriced:custom"))
+            .is_none());
+        assert_eq!(
+            lookup.calculate_cost_with_provider("gpt-5.4", Some("unpriced:subscription"), &usage,),
+            0.0
+        );
+    }
+
+    /// The shortest-key tie-break is a coin flip. Preferring the original
+    /// provider generalizes the `anthropic/` special case it replaced, so a
+    /// reseller no longer wins on key length alone.
+    #[test]
+    fn model_part_tie_break_prefers_the_original_provider_over_a_shorter_key() {
+        assert!(super::prefers_model_part_key(
+            "openai/some-model",
+            "xy/some-model"
+        ));
+        assert!(!super::prefers_model_part_key(
+            "xy/some-model",
+            "openai/some-model"
+        ));
+        // Neither is an original provider: length still decides.
+        assert!(super::prefers_model_part_key(
+            "ab/some-model",
+            "abcd/some-model"
+        ));
+    }
+
+    /// Folding `deepseek-ai` into `deepseek` widens the provider-hint
+    /// candidate pool, and `deepseek` is exactly the hint
+    /// `inferred_provider_from_model` synthesizes for every model named
+    /// `deepseek-*` whose client reports no provider. Both rows below then
+    /// match the hint, they disagree by 16x on output, and nothing else in
+    /// `select_best_match` tells them apart — the winner would fall out of key
+    /// ordering, which is length-descending over a HashMap's key iteration and
+    /// so not stable between processes for equal-length keys. The row spelling
+    /// the vendor the way the hint does has to win.
+    #[test]
+    fn vendor_spelling_fold_does_not_move_pricing_onto_another_reseller() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "novita/deepseek/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000003),
+                output_cost_per_token: Some(0.0000003),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "cloudflare/@cf/deepseek-ai/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000000497),
+                output_cost_per_token: Some(0.000004881),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("deepseek-r1-distill-qwen-32b", Some("deepseek"))
+            .expect("deepseek-hinted distill must price");
+        assert_eq!(
+            result.matched_key, "novita/deepseek/deepseek-r1-distill-qwen-32b",
+            "a `deepseek` hint must not cross onto the `deepseek-ai`-spelled reseller row"
+        );
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.0000003));
+    }
+
+    /// The other direction of the same fold, which the spelling preference must
+    /// not break: a `deepseek-ai` hint exists so it can reach rows spelled
+    /// `deepseek`, and DeepSeek's own first-party row is the whole point. A
+    /// reseller row that happens to spell the vendor the hint's way must not
+    /// displace it.
+    #[test]
+    fn vendor_spelling_preference_never_displaces_the_first_party_row() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "deepseek/deepseek-v3".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000027),
+                output_cost_per_token: Some(0.0000011),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "hyperbolic/deepseek-ai/DeepSeek-V3".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000002),
+                output_cost_per_token: Some(0.0000002),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        for hint in ["deepseek-ai", "deepseek_ai", "DeepSeek-AI", "deepseek"] {
+            let result = lookup
+                .lookup_with_provider("deepseek-v3", Some(hint))
+                .unwrap_or_else(|| panic!("{hint}-hinted deepseek-v3 must price"));
+            assert_eq!(
+                result.matched_key, "deepseek/deepseek-v3",
+                "{hint} must still reach DeepSeek's own row"
+            );
+        }
+    }
+
+    /// The spelling preference is a tiebreak among rows that merely nest the
+    /// vendor, so it must yield to the hinted provider's own top-level row.
+    /// `poe/novita/kimi-k2.6` spells `novita` only because Poe is reselling
+    /// Novita's endpoint, and it charges $0.96/$4.04 per MTok against Novita's
+    /// own $0.80/$3.40.
+    #[test]
+    fn hinted_provider_own_row_outranks_a_nested_spelling_match() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "novita-ai/moonshotai/kimi-k2.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000008),
+                output_cost_per_token: Some(0.0000034),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "poe/novita/kimi-k2.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000096),
+                output_cost_per_token: Some(0.00000404),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("kimi-k2.6", Some("novita"))
+            .expect("novita-hinted kimi-k2.6 must price");
+        assert_eq!(
+            result.matched_key, "novita-ai/moonshotai/kimi-k2.6",
+            "Novita's own row must win over Poe reselling it"
+        );
+    }
+
+    /// Kimi, Warp, Kiro, Codebuff and Tencent Buddy report the literal string
+    /// `unknown` when they cannot name a provider, and `normalize_provider_hint`
+    /// drops it, so the unhinted path is reached in production. It has no
+    /// vendor spelling to prefer and must resolve exactly as a missing hint
+    /// does.
+    #[test]
+    fn unhinted_lookup_is_unchanged_by_the_vendor_spelling_preference() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "novita/deepseek/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000003),
+                output_cost_per_token: Some(0.0000003),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "cloudflare/@cf/deepseek-ai/deepseek-r1-distill-qwen-32b".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000000497),
+                output_cost_per_token: Some(0.000004881),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let bare = lookup.lookup_with_provider("deepseek-r1-distill-qwen-32b", None);
+        for hint in [Some("unknown"), Some("UNKNOWN"), Some(""), Some("  ")] {
+            let hinted = lookup.lookup_with_provider("deepseek-r1-distill-qwen-32b", hint);
+            assert_eq!(
+                hinted.map(|r| r.matched_key),
+                bare.as_ref().map(|r| r.matched_key.clone()),
+                "{hint:?} is dropped by normalize_provider_hint and must match the unhinted result"
+            );
+        }
+    }
+
+    /// `key_root_matches_hint` recognises the hinted vendor's own top-level
+    /// row, and that row has to be *selected*, not merely used to switch the
+    /// spelling preference off. Z.ai publishes `zai/glm-4.6` at $0.60/$2.20 per
+    /// MTok and Vercel's gateway resells it at $0.45/$1.80 under
+    /// `vercel_ai_gateway/zai/glm-4.6`; neither key is in
+    /// `ORIGINAL_PROVIDER_PREFIXES` (Z.ai's first-party spelling there is
+    /// `z-ai/`) nor in `RESELLER_PROVIDER_PREFIXES`, and candidates are ordered
+    /// longest key first, so a `zai` hint must not be billed at the gateway's
+    /// sheet just because its key is longer.
+    #[test]
+    fn hinted_vendor_own_row_wins_over_a_longer_row_that_only_nests_the_vendor() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "zai/glm-4.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000006),
+                output_cost_per_token: Some(0.0000022),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "vercel_ai_gateway/zai/glm-4.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000045),
+                output_cost_per_token: Some(0.0000018),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("glm-4.6", Some("zai"))
+            .expect("zai-hinted glm-4.6 must price");
+        assert_eq!(
+            result.matched_key, "zai/glm-4.6",
+            "Z.ai's own row must win over a gateway that nests `zai` in a longer key"
+        );
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.0000022));
+    }
+
+    /// The spelling preference exists to keep a hinted vendor on the row that
+    /// spells the vendor its way, so it must not throw that row away for
+    /// starting with a reseller prefix. Before the fold, a `deepseek-ai` hint
+    /// matched only `together_ai/deepseek-ai/DeepSeek-R1` ($3.00/$7.00 per
+    /// MTok); folding `deepseek-ai` into `deepseek` pulled
+    /// `vercel_ai_gateway/deepseek/deepseek-r1` ($0.55/$2.19) into the same
+    /// pool, and it wins on key length alone. That is the fold moving usage
+    /// between two resellers, which is precisely what the preference is for.
+    #[test]
+    fn exact_vendor_spelling_wins_even_when_that_row_is_a_reseller() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "together_ai/deepseek-ai/DeepSeek-R1".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000007),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "vercel_ai_gateway/deepseek/deepseek-r1".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000055),
+                output_cost_per_token: Some(0.00000219),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("deepseek-r1", Some("deepseek-ai"))
+            .expect("deepseek-ai-hinted deepseek-r1 must price");
+        assert_eq!(
+            result.matched_key, "together_ai/deepseek-ai/DeepSeek-R1",
+            "the row spelling the vendor the hint's way must win even though it is a reseller"
+        );
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.000007));
+    }
+
+    /// Vertex canonicalizes to Anthropic so an Anthropic hint can find Vertex's
+    /// hosted Claude rows. That alias must not make the hosting platform's root
+    /// look like Anthropic's own top-level row and outrank an exact-spelling row.
+    #[test]
+    fn reseller_alias_root_does_not_outrank_exact_vendor_spelling() {
+        for vertex_root in ["vertex", "vertex_ai"] {
+            let hosted_key = format!("{vertex_root}/claude-sonnet-4");
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                hosted_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            litellm.insert(
+                "host/anthropic/claude-sonnet-4".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+            let anthropic = lookup
+                .lookup_with_provider("claude-sonnet-4", Some("anthropic"))
+                .expect("anthropic-hinted claude-sonnet-4 must price");
+            assert_eq!(
+                anthropic.matched_key, "host/anthropic/claude-sonnet-4",
+                "{vertex_root} must not impersonate Anthropic's own root"
+            );
+
+            let vertex = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(vertex_root))
+                .unwrap_or_else(|| panic!("{vertex_root}-hinted claude-sonnet-4 must price"));
+            assert_eq!(
+                vertex.matched_key, hosted_key,
+                "a Vertex hint must still select Vertex's hosted row"
+            );
+        }
+    }
+
+    /// Direct Vertex hints must keep Vertex's hosted pricing even when an
+    /// Anthropic first-party row is also available. The canonical provider tag
+    /// makes both candidates reachable; the raw hint decides which root owns
+    /// the usage.
+    #[test]
+    fn direct_vertex_hint_outranks_anthropic_first_party_alias() {
+        for vertex_root in ["vertex", "vertex_ai"] {
+            let hosted_key = format!("{vertex_root}/claude-sonnet-4");
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                hosted_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            litellm.insert(
+                "anthropic/claude-sonnet-4".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+            let vertex = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(vertex_root))
+                .unwrap_or_else(|| panic!("{vertex_root}-hinted claude-sonnet-4 must price"));
+            assert_eq!(vertex.matched_key, hosted_key);
+
+            let anthropic = lookup
+                .lookup_with_provider("claude-sonnet-4", Some("anthropic"))
+                .expect("anthropic-hinted claude-sonnet-4 must price");
+            assert_eq!(anthropic.matched_key, "anthropic/claude-sonnet-4");
+        }
+    }
+
+    /// The same explicit-root preference must survive source arbitration;
+    /// otherwise each dataset selects correctly and the later cross-source
+    /// first-party tier silently changes the winner back to Anthropic.
+    #[test]
+    fn direct_vertex_hint_outranks_cross_source_anthropic_alias() {
+        for vertex_root in ["vertex", "vertex_ai"] {
+            let hosted_key = format!("{vertex_root}/claude-sonnet-4");
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                hosted_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            let mut openrouter = HashMap::new();
+            openrouter.insert(
+                "anthropic/claude-sonnet-4".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+            let vertex = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(vertex_root))
+                .unwrap_or_else(|| panic!("{vertex_root}-hinted claude-sonnet-4 must price"));
+            assert_eq!(vertex.matched_key, hosted_key);
+            assert_eq!(vertex.source, "LiteLLM");
+
+            let anthropic = lookup
+                .lookup_with_provider("claude-sonnet-4", Some("anthropic"))
+                .expect("anthropic-hinted claude-sonnet-4 must price");
+            assert_eq!(anthropic.matched_key, "anthropic/claude-sonnet-4");
+            assert_eq!(anthropic.source, "OpenRouter");
+        }
+    }
+
+    /// `vertex` and `vertex_ai` share a provider tag for fallback reachability,
+    /// but are distinct billing endpoints. The literal root must win in either
+    /// direction even though the longer `vertex_ai` key is ordered first.
+    #[test]
+    fn vertex_endpoint_aliases_do_not_impersonate_each_others_own_root() {
+        let mut litellm = HashMap::new();
+        for key in ["vertex/claude-sonnet-4", "vertex_ai/claude-sonnet-4"] {
+            litellm.insert(
+                key.to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+        }
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        for hint in ["vertex", "vertex_ai"] {
+            let result = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(hint))
+                .unwrap_or_else(|| panic!("{hint}-hinted claude-sonnet-4 must price"));
+            assert_eq!(result.matched_key, format!("{hint}/claude-sonnet-4"));
+        }
+    }
+
+    #[test]
+    fn vertex_endpoint_literal_root_survives_cross_source_arbitration() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "vertex/claude-sonnet-4".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                ..Default::default()
+            },
+        );
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "vertex_ai/claude-sonnet-4".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000004),
+                output_cost_per_token: Some(0.000020),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        for (hint, key, source) in [
+            ("vertex", "vertex/claude-sonnet-4", "LiteLLM"),
+            ("vertex_ai", "vertex_ai/claude-sonnet-4", "OpenRouter"),
+        ] {
+            let result = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(hint))
+                .unwrap_or_else(|| panic!("{hint}-hinted claude-sonnet-4 must price"));
+            assert_eq!(result.matched_key, key);
+            assert_eq!(result.source, source);
+        }
+    }
+
+    /// A literal provider root in Models.dev must participate in the same
+    /// arbitration as LiteLLM and OpenRouter instead of losing to their
+    /// alias-only row merely because Models.dev is normally the long-tail
+    /// fallback. Exercise both directions of the Anthropic/Vertex relation.
+    #[test]
+    fn models_dev_literal_root_outranks_cross_source_endpoint_alias() {
+        for (hint, own_root, alias_root) in [
+            ("vertex", "vertex", "anthropic"),
+            ("vertex_ai", "vertex_ai", "anthropic"),
+            ("anthropic", "anthropic", "vertex"),
+            ("anthropic", "anthropic", "vertex_ai"),
+        ] {
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                format!("{alias_root}/claude-sonnet-4"),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            let mut models_dev = HashMap::new();
+            let own_key = format!("{own_root}/claude-sonnet-4");
+            models_dev.insert(
+                own_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new_with_models_dev(
+                litellm,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                models_dev,
+            );
+
+            let result = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(hint))
+                .unwrap_or_else(|| panic!("{hint}-hinted claude-sonnet-4 must price"));
+            assert_eq!(result.matched_key, own_key);
+            assert_eq!(result.source, "Models.dev");
+        }
+    }
+
+    #[test]
+    fn normalized_models_dev_literal_root_outranks_cross_source_endpoint_alias() {
+        for (hint, own_root, alias_root) in [
+            ("vertex", "vertex", "anthropic"),
+            ("vertex_ai", "vertex_ai", "anthropic"),
+            ("anthropic", "anthropic", "vertex"),
+            ("anthropic", "anthropic", "vertex_ai"),
+        ] {
+            let mut openrouter = HashMap::new();
+            openrouter.insert(
+                format!("{alias_root}/claude-sonnet-4-6"),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            let mut models_dev = HashMap::new();
+            let own_key = format!("{own_root}/claude-sonnet-4-6");
+            models_dev.insert(
+                own_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new_with_models_dev(
+                HashMap::new(),
+                openrouter,
+                HashMap::new(),
+                HashMap::new(),
+                models_dev,
+            );
+
+            let result = lookup
+                .lookup_with_provider("claude-sonnet-4.6", Some(hint))
+                .unwrap_or_else(|| panic!("normalized {hint}-hinted Claude must price"));
+            assert_eq!(result.matched_key, own_key);
+            assert_eq!(result.source, "Models.dev");
+        }
+    }
+
+    /// A root globally classified as a reseller can still be the hinted
+    /// provider's own top-level row. Together's row must retain the root tier
+    /// over a longer host that merely nests the Together spelling.
+    #[test]
+    fn reseller_classification_does_not_hide_hinted_provider_own_root() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "together_ai/model-x".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000002),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "long-host/together/model-x".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000004),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("model-x", Some("together"))
+            .expect("together-hinted model-x must price");
+        assert_eq!(result.matched_key, "together_ai/model-x");
     }
 }

@@ -1,12 +1,12 @@
 import { unstable_cache } from "next/cache";
-import { and, asc, desc, eq, gte, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, lte, sql } from "drizzle-orm";
 import { db, dailyBreakdown, groupMembers, submissions, users } from "@/lib/db";
 import type { LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
+import { hasDirectives, parseSearchDirectives } from "@/lib/leaderboard/searchDirectives";
 import {
-  escapeLikePattern,
-  hasDirectives,
-  parseSearchDirectives,
-} from "@/lib/leaderboard/searchDirectives";
+  scopeBreakdownToDirectives,
+  type PeriodSourceBreakdown,
+} from "@/lib/leaderboard/sourceBreakdown";
 
 interface GroupLeaderboardPeriodRow {
   userId: string;
@@ -16,10 +16,10 @@ interface GroupLeaderboardPeriodRow {
   role: string;
   tokens: number;
   cost: number;
-  sourceBreakdown: Record<string, { models: Record<string, unknown> }> | null;
+  sourceBreakdown: PeriodSourceBreakdown | null;
 }
 
-interface GroupLeaderboardDbRow {
+interface GroupLeaderboardDbRow extends Record<string, unknown> {
   userId: string;
   username: string;
   displayName: string | null;
@@ -93,9 +93,13 @@ function compareGroupUsers(
   return left.username.localeCompare(right.username);
 }
 
-function matchesSearch(user: Pick<GroupLeaderboardUser, "username">, search: string): boolean {
-  const parsed = parseSearchDirectives(search);
-  return !parsed.text || user.username.toLowerCase().includes(parsed.text.toLowerCase());
+function matchesSearch(
+  user: Pick<GroupLeaderboardUser, "username" | "displayName">,
+  normalizedText: string
+): boolean {
+  return normalizedText.length === 0 ||
+    user.username.toLowerCase().includes(normalizedText) ||
+    (user.displayName?.toLowerCase().includes(normalizedText) ?? false);
 }
 
 function paginateRankedUsers(
@@ -108,7 +112,8 @@ function paginateRankedUsers(
   totalMembers: number
 ): GroupLeaderboardData {
   const offset = (page - 1) * limit;
-  const filteredUsers = usersWithRanks.filter((user) => matchesSearch(user, search));
+  const normalizedText = parseSearchDirectives(search).text.toLowerCase();
+  const filteredUsers = usersWithRanks.filter((user) => matchesSearch(user, normalizedText));
   const pagedUsers = filteredUsers.slice(offset, offset + limit);
 
   return {
@@ -145,29 +150,9 @@ function buildPeriodGroupLeaderboardData(
 
   let filteredRows = rows;
   if (hasDirectives(parsed)) {
-    filteredRows = rows.filter((row) => {
-      if (!row.sourceBreakdown) return false;
-
-      const clientKeys = Object.keys(row.sourceBreakdown).map((k) => k.toLowerCase());
-      const modelKeys = Object.values(row.sourceBreakdown).flatMap((client) =>
-        client.models ? Object.keys(client.models).map((m) => m.toLowerCase()) : []
-      );
-
-      if (parsed.clients.length > 0) {
-        const hasMatchingClient = parsed.clients.some((c) =>
-          clientKeys.some((k) => k.includes(c))
-        );
-        if (!hasMatchingClient) return false;
-      }
-
-      if (parsed.models.length > 0) {
-        const hasMatchingModel = parsed.models.some((m) =>
-          modelKeys.some((k) => k.includes(m))
-        );
-        if (!hasMatchingModel) return false;
-      }
-
-      return true;
+    filteredRows = rows.flatMap((row) => {
+      const scoped = scopeBreakdownToDirectives(row.sourceBreakdown, parsed);
+      return scoped ? [{ ...row, tokens: scoped.tokens, cost: scoped.cost }] : [];
     });
   }
 
@@ -244,7 +229,15 @@ async function fetchPeriodRows(
         eq(groupMembers.groupId, groupId)
       )
     )
-    .where(and(gte(dailyBreakdown.date, dateRange.start), lte(dailyBreakdown.date, dateRange.end)));
+    // A group board is still a ranking, so a site-wide hide applies here too —
+    // otherwise a hidden account keeps topping every group it belongs to.
+    .where(
+      and(
+        eq(users.leaderboardHidden, false),
+        gte(dailyBreakdown.date, dateRange.start),
+        lte(dailyBreakdown.date, dateRange.end)
+      )
+    );
 
   return rows.map((row) => ({
     userId: row.userId,
@@ -254,12 +247,95 @@ async function fetchPeriodRows(
     role: row.role,
     tokens: Number(row.tokens) || 0,
     cost: Number(row.cost) || 0,
-    sourceBreakdown: (row.sourceBreakdown as Record<string, { models: Record<string, unknown> }>) ?? null,
+    sourceBreakdown: row.sourceBreakdown ?? null,
   }));
+}
+
+function escapeLeaderboardLike(value: string): string {
+  return value.replace(/[!%_]/g, "!$&");
+}
+
+function likeAny(
+  column: ReturnType<typeof sql>,
+  values: string[]
+): ReturnType<typeof sql> {
+  if (values.length === 0) return sql`TRUE`;
+  const patterns = values.map((value) => `%${escapeLeaderboardLike(value)}%`);
+  return sql`(${sql.join(
+    patterns.map((pattern) => sql`LOWER(${column}) LIKE ${pattern} ESCAPE '!'`),
+    sql` OR `
+  )})`;
+}
+
+function toRankedAllTimeRows(rows: GroupLeaderboardDbRow[]): GroupLeaderboardUser[] {
+  return rows.map((row, index) => ({
+    rank: index + 1,
+    userId: row.userId,
+    username: row.username,
+    displayName: row.displayName,
+    avatarUrl: row.avatarUrl,
+    role: row.role,
+    totalTokens: Number(row.totalTokens) || 0,
+    totalCost: Number(row.totalCost) || 0,
+  }));
+}
+
+// The submission-level source/model arrays only prove that a client or model
+// occurred somewhere in a user's history. They cannot say how much it used or
+// whether a requested client and model occurred together. Filtered all-time
+// boards therefore aggregate the same per-client/per-model daily JSON used by
+// period boards; rows from before that JSON existed deliberately contribute
+// nothing rather than re-crediting the user's entire lifetime total.
+async function fetchScopedAllTimeRows(
+  groupId: string,
+  sortBy: SortBy,
+  clients: string[],
+  models: string[]
+): Promise<GroupLeaderboardUser[]> {
+  const usesModels = models.length > 0;
+  const selectedBreakdown = usesModels ? sql`model.value` : sql`client.value`;
+  const clientCondition = likeAny(sql`client.key`, clients);
+  const modelRows = usesModels
+    ? sql`CROSS JOIN LATERAL jsonb_each(COALESCE(client.value->'models', '{}'::jsonb)) AS model(key, value)`
+    : sql``;
+  const modelCondition = usesModels
+    ? sql`AND ${likeAny(sql`model.key`, models)}`
+    : sql``;
+  const primaryOrderBy = sortBy === "cost" ? sql`"totalCost"` : sql`"totalTokens"`;
+  const secondaryOrderBy = sortBy === "cost" ? sql`"totalTokens"` : sql`"totalCost"`;
+
+  const rows = await db.execute<GroupLeaderboardDbRow>(sql`
+    SELECT
+      u.id AS "userId",
+      u.username,
+      u.display_name AS "displayName",
+      u.avatar_url AS "avatarUrl",
+      gm.role,
+      SUM(COALESCE((${selectedBreakdown}->>'tokens')::numeric, 0)) AS "totalTokens",
+      SUM(COALESCE((${selectedBreakdown}->>'cost')::numeric, 0)) AS "totalCost"
+    FROM group_members gm
+    INNER JOIN users u ON gm.user_id = u.id
+    INNER JOIN submissions s ON s.user_id = u.id
+    INNER JOIN daily_breakdown d ON d.submission_id = s.id
+    CROSS JOIN LATERAL jsonb_each(COALESCE(d.source_breakdown, '{}'::jsonb)) AS client(key, value)
+    ${modelRows}
+    WHERE gm.group_id = ${groupId}
+      AND u.leaderboard_hidden = false
+      AND ${clientCondition}
+      ${modelCondition}
+    GROUP BY u.id, u.username, u.display_name, u.avatar_url, gm.role
+    ORDER BY ${primaryOrderBy} DESC, ${secondaryOrderBy} DESC, LOWER(u.username) ASC, u.id ASC
+  `);
+
+  return toRankedAllTimeRows(rows);
 }
 
 async function fetchAllTimeRows(groupId: string, sortBy: SortBy, search: string = ""): Promise<GroupLeaderboardUser[]> {
   const parsed = parseSearchDirectives(search);
+
+  if (hasDirectives(parsed)) {
+    return fetchScopedAllTimeRows(groupId, sortBy, parsed.clients, parsed.models);
+  }
 
   const primaryOrderByColumn = sortBy === "cost"
     ? sql`SUM(CAST(${submissions.totalCost} AS DECIMAL(18,4)))`
@@ -267,17 +343,6 @@ async function fetchAllTimeRows(groupId: string, sortBy: SortBy, search: string 
   const secondaryOrderByColumn = sortBy === "cost"
     ? sql`SUM(${submissions.totalTokens})`
     : sql`SUM(CAST(${submissions.totalCost} AS DECIMAL(18,4)))`;
-
-  const clientConditions = parsed.clients.map((client) =>
-    sql`EXISTS (SELECT 1 FROM unnest(${submissions.sourcesUsed}) AS s WHERE LOWER(s) LIKE ${`%${escapeLikePattern(client)}%`})`
-  );
-  const modelConditions = parsed.models.map((model) =>
-    sql`EXISTS (SELECT 1 FROM unnest(${submissions.modelsUsed}) AS m WHERE LOWER(m) LIKE ${`%${escapeLikePattern(model)}%`})`
-  );
-  const conditions = [
-    clientConditions.length > 0 ? or(...clientConditions) : undefined,
-    modelConditions.length > 0 ? or(...modelConditions) : undefined,
-  ].filter((condition): condition is ReturnType<typeof sql> => condition !== undefined);
 
   const rows = await db
     .select({
@@ -298,7 +363,7 @@ async function fetchAllTimeRows(groupId: string, sortBy: SortBy, search: string 
         eq(groupMembers.groupId, groupId)
       )
     )
-    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .where(eq(users.leaderboardHidden, false))
     .groupBy(users.id, users.username, users.displayName, users.avatarUrl, groupMembers.role)
     .orderBy(
       desc(primaryOrderByColumn),
@@ -307,16 +372,7 @@ async function fetchAllTimeRows(groupId: string, sortBy: SortBy, search: string 
       asc(users.id)
     );
 
-  return (rows as GroupLeaderboardDbRow[]).map((row, index) => ({
-    rank: index + 1,
-    userId: row.userId,
-    username: row.username,
-    displayName: row.displayName,
-    avatarUrl: row.avatarUrl,
-    role: row.role,
-    totalTokens: Number(row.totalTokens) || 0,
-    totalCost: Number(row.totalCost) || 0,
-  }));
+  return toRankedAllTimeRows(rows as GroupLeaderboardDbRow[]);
 }
 
 async function fetchGroupLeaderboardData(

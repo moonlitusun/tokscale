@@ -470,6 +470,7 @@ fn build_output(parsed: ParsedBilling) -> UsageOutput {
     UsageOutput {
         provider: "Sakana".into(),
         account: None,
+        credential_source: None,
         plan,
         email: None,
         metrics,
@@ -509,7 +510,7 @@ pub fn fetch() -> Result<UsageOutput> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let client = reqwest::Client::builder()
+        let client = tokscale_core::http::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()?;

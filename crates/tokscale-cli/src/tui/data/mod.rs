@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
@@ -7,8 +7,8 @@ use tokio::runtime::{Handle, Runtime};
 
 use tokscale_core::sessions::UnifiedMessage;
 use tokscale_core::{
-    normalize_model_for_grouping, parse_local_unified_messages, sessions, ClientId, GroupBy,
-    LocalParseOptions, ModelPerformance,
+    model_name_for_grouping, normalize_model_for_grouping, parse_local_unified_messages, sessions,
+    ClientId, GroupBy, LocalParseOptions, ModelPerformance, WorktreeRollup,
 };
 
 /// Returns the scanner settings that `DataLoader` should use when building
@@ -48,6 +48,7 @@ impl TokenBreakdown {
 #[derive(Debug, Clone)]
 pub struct ModelUsage {
     pub model: String,
+    pub color_key: String,
     pub provider: String,
     pub client: String,
     pub workspace_key: Option<String>,
@@ -141,6 +142,69 @@ pub struct MonthlyUsage {
     pub turn_count: u32,
 }
 
+/// Per-session usage rollup. One row per `(client, session_id)` pair so the
+/// Sessions tab can show cost/tokens broken down by individual conversation
+/// alongside how long the session was active and when it last saw activity.
+#[derive(Debug, Clone)]
+pub struct SessionUsage {
+    pub session_id: String,
+    pub client: String,
+    /// Human-readable session title when the source client stores one
+    /// (e.g. OpenCode's `session.title` column). `None` for clients that
+    /// don't record a title.
+    pub title: Option<String>,
+    /// Distinct models used across messages in this session, in first-seen
+    /// order. Most sessions use a single model; a few switch mid-conversation.
+    pub models: Vec<SessionModel>,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub message_count: u32,
+    pub turn_count: u32,
+    /// Unix-ms timestamp of the first message observed in this session.
+    /// `0` when every message lacked a usable timestamp.
+    pub first_active_ms: i64,
+    /// Unix-ms timestamp of the most recent message observed in this session.
+    /// `0` when every message lacked a usable timestamp.
+    pub last_active_ms: i64,
+}
+
+/// A model entry within a session, retaining the provider and color_key
+/// needed for correct family-shade color lookup alongside the display name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionModel {
+    pub display_name: String,
+    pub provider: String,
+    pub color_key: String,
+}
+
+/// Per-project (workspace) usage rollup. One row per workspace grouping key
+/// so the Projects tab can show cost/tokens rolled up per project regardless
+/// of the global `GroupBy` the Models tab is using.
+#[derive(Debug, Clone)]
+pub struct ProjectUsage {
+    /// Stable workspace/repo identity, or a synthetic category for Codex chats.
+    pub group_key: String,
+    pub workspace_key: Option<String>,
+    /// Display label after the `workspace_label_overrides` disambiguation pass.
+    pub label: String,
+    /// Real filesystem path the key resolves to, when it names one.
+    pub path: Option<String>,
+    /// Distinct clients seen in this project, in first-seen order.
+    pub clients: Vec<String>,
+    /// Distinct models used in this project, in first-seen order.
+    pub models: Vec<SessionModel>,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub message_count: u32,
+    pub session_count: u32,
+    /// Unix-ms timestamp of the first message observed in this project.
+    /// `0` when every message lacked a usable timestamp.
+    pub first_active_ms: i64,
+    /// Unix-ms timestamp of the most recent message observed in this project.
+    /// `0` when every message lacked a usable timestamp.
+    pub last_active_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContributionDay {
     pub date: NaiveDate,
@@ -162,6 +226,8 @@ pub struct UsageData {
     pub hourly: Vec<HourlyUsage>,
     pub minutely: Vec<MinutelyUsage>,
     pub monthly: Vec<MonthlyUsage>,
+    pub sessions: Vec<SessionUsage>,
+    pub projects: Vec<ProjectUsage>,
     pub graph: Option<GraphData>,
     pub total_tokens: u64,
     pub total_cost: f64,
@@ -177,26 +243,41 @@ pub struct DataLoader {
     pub until: Option<String>,
     pub year: Option<String>,
     pub minutely_enabled: bool,
+    pub projects_enabled: bool,
+    pub worktree_rollup: WorktreeRollup,
 }
 
+#[cfg(test)]
 const UNKNOWN_WORKSPACE_LABEL: &str = "Unknown workspace";
-const UNKNOWN_WORKSPACE_GROUP_KEY: &str = "\0unknown-workspace";
 
-fn workspace_bucket(msg: &UnifiedMessage) -> (String, Option<String>, String) {
-    match (&msg.workspace_key, &msg.workspace_label) {
-        (Some(key), Some(label)) => (key.clone(), Some(key.clone()), label.clone()),
-        (Some(key), None) => (
-            key.clone(),
-            Some(key.clone()),
-            tokscale_core::sessions::workspace_label_from_key(key)
-                .unwrap_or_else(|| UNKNOWN_WORKSPACE_LABEL.to_string()),
-        ),
-        _ => (
-            UNKNOWN_WORKSPACE_GROUP_KEY.to_string(),
-            None,
-            UNKNOWN_WORKSPACE_LABEL.to_string(),
-        ),
+const CODEX_CHAT_GROUP_KEY: &str = "\0codex-chat";
+const CODEX_CHAT_LABEL: &str = "Codex Chat";
+
+// Workspace bucketing lives in tokscale_core::workspace_bucket so this
+// aggregation and the CLI report agree on worktree rollup and on labeling
+// Claude Code's dash-mangled keys.
+
+fn is_codex_chat_workspace(key: &str) -> bool {
+    // Codex Desktop gives projectless chats a dated directory under Documents.
+    // Match the complete date/slug layout, including historical directories
+    // that no longer exist. Ordinary folders under Documents/Codex stay separate.
+    let Some((_, relative)) = key.rsplit_once("/Documents/Codex/") else {
+        return false;
+    };
+    let Some((date, slug)) = relative.split_once('/') else {
+        return false;
+    };
+    if date.len() != 10
+        || NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err()
+        || slug.is_empty()
+        || matches!(slug, "." | "..")
+        || slug.contains('/')
+    {
+        return false;
     }
+
+    // A chat directory can become a real repository or a git worktree.
+    !Path::new(key).join(".git").exists()
 }
 
 fn positive_unified_token_total(tokens: &tokscale_core::TokenBreakdown) -> i64 {
@@ -294,6 +375,8 @@ impl DataLoader {
             until: None,
             year: None,
             minutely_enabled: false,
+            projects_enabled: false,
+            worktree_rollup: WorktreeRollup::default(),
         }
     }
 
@@ -309,11 +392,23 @@ impl DataLoader {
             until,
             year,
             minutely_enabled: false,
+            projects_enabled: false,
+            worktree_rollup: WorktreeRollup::default(),
         }
     }
 
     pub fn with_minutely_enabled(mut self, enabled: bool) -> Self {
         self.minutely_enabled = enabled;
+        self
+    }
+
+    pub fn with_projects_enabled(mut self, enabled: bool) -> Self {
+        self.projects_enabled = enabled;
+        self
+    }
+
+    pub fn with_worktree_rollup(mut self, rollup: WorktreeRollup) -> Self {
+        self.worktree_rollup = rollup;
         self
     }
 
@@ -323,7 +418,7 @@ impl DataLoader {
         group_by: &GroupBy,
         include_synthetic: bool,
     ) -> Result<UsageData> {
-        let home = dirs::home_dir()
+        let home = crate::paths::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
             .to_string_lossy()
             .to_string();
@@ -372,7 +467,7 @@ impl DataLoader {
         include_synthetic: bool,
         pricing: &tokscale_core::pricing::PricingService,
     ) -> Result<UsageData> {
-        let home = dirs::home_dir()
+        let home = crate::paths::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
             .to_string_lossy()
             .to_string();
@@ -430,10 +525,113 @@ impl DataLoader {
         let mut hourly_map: HashMap<NaiveDateTime, HourlyUsage> = HashMap::new();
         let mut minutely_map: HashMap<NaiveDateTime, MinutelyUsage> = HashMap::new();
         let mut model_session_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut session_map: HashMap<String, SessionUsage> = HashMap::new();
+        let mut project_map: HashMap<String, ProjectUsage> = HashMap::new();
+        let mut project_session_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        // Memoizes the filesystem probes that resolve a workspace key to a label.
+        let mut workspace_labeler = tokscale_core::WorkspaceLabeler::default();
+        // Labels are basenames, so two different directories that share one paint
+        // the same row text. Resolve the whole set up front so collisions can be
+        // qualified before the first row -- and use the same core helper the CLI
+        // report does, because a label that differs between the two views is a
+        // bug report waiting to happen.
+        let workspace_label_overrides = if *group_by == GroupBy::WorkspaceModel {
+            tokscale_core::workspace_label_overrides(
+                &messages,
+                self.worktree_rollup,
+                &mut workspace_labeler,
+            )
+        } else {
+            HashMap::new()
+        };
+        // Inspect each distinct Codex path once, rather than probing .git for
+        // every usage event. Keep the raw workspace metadata for other views.
+        let mut codex_chat_workspaces: HashSet<&str> = if self.projects_enabled {
+            messages
+                .iter()
+                .filter(|msg| msg.client == "codex")
+                .filter_map(|msg| msg.workspace_key.as_deref())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        codex_chat_workspaces.retain(|key| is_codex_chat_workspace(key));
+        let is_codex_chat = |msg: &UnifiedMessage| {
+            msg.client == "codex"
+                && msg
+                    .workspace_key
+                    .as_deref()
+                    .is_some_and(|key| codex_chat_workspaces.contains(key))
+        };
+
+        // Projects otherwise group by repo identity (MergeIntoRepo): Claude Code's
+        // dash-mangled slugs and the real paths other clients record must land
+        // in one row. Overrides are keyed by group key, so this needs its own
+        // pass whenever the Models grouping above uses different semantics.
+        let mut projects_label_overrides = if self.projects_enabled {
+            tokscale_core::workspace_label_overrides(
+                messages.iter().filter(|msg| !is_codex_chat(msg)),
+                WorktreeRollup::MergeIntoRepo,
+                &mut workspace_labeler,
+            )
+        } else {
+            HashMap::new()
+        };
+        if !codex_chat_workspaces.is_empty() {
+            // Reserve the category label; a real project with the same name
+            // keeps its own identity and is shown with its path instead.
+            for (key, label) in &mut projects_label_overrides {
+                if label == CODEX_CHAT_LABEL {
+                    *label = key.clone();
+                }
+            }
+        }
 
         for msg in &messages {
-            let normalized_model = normalize_model_for_grouping(&msg.model_id);
-            let (workspace_group_key, workspace_key, workspace_label) = workspace_bucket(msg);
+            let normalized_model =
+                model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
+            let model_key = normalize_model_for_grouping(&msg.model_id);
+            // Resolving a workspace label reads the filesystem, and groupings
+            // other than WorkspaceModel throw it away — the TUI defaults to
+            // ClientModel and auto-refreshes, so it is only paid when the
+            // workspace grouping or the Projects tab actually consumes it.
+            let (workspace_group_key, workspace_key, workspace_label) =
+                if *group_by == GroupBy::WorkspaceModel {
+                    let (group_key, key, label) = tokscale_core::workspace_bucket(
+                        msg,
+                        self.worktree_rollup,
+                        &mut workspace_labeler,
+                    );
+                    let label = workspace_label_overrides
+                        .get(&group_key)
+                        .cloned()
+                        .unwrap_or(label);
+                    (group_key, key, label)
+                } else {
+                    (String::new(), None, String::new())
+                };
+            let (project_group_key, project_key, project_label) = if self.projects_enabled {
+                if is_codex_chat(msg) {
+                    (
+                        CODEX_CHAT_GROUP_KEY.to_string(),
+                        None,
+                        CODEX_CHAT_LABEL.to_string(),
+                    )
+                } else {
+                    let (group_key, key, label) = tokscale_core::workspace_bucket(
+                        msg,
+                        WorktreeRollup::MergeIntoRepo,
+                        &mut workspace_labeler,
+                    );
+                    let label = projects_label_overrides
+                        .get(&group_key)
+                        .cloned()
+                        .unwrap_or(label);
+                    (group_key, key, label)
+                }
+            } else {
+                (String::new(), None, String::new())
+            };
             let key = match group_by {
                 GroupBy::Model => normalized_model.clone(),
                 GroupBy::ClientModel => format!("{}:{}", msg.client, normalized_model),
@@ -452,6 +650,7 @@ impl DataLoader {
 
             let model_entry = model_map.entry(key.clone()).or_insert_with(|| ModelUsage {
                 model: normalized_model.clone(),
+                color_key: model_key.clone(),
                 provider: msg.provider_id.clone(),
                 client: msg.client.clone(),
                 workspace_key: if *group_by == GroupBy::WorkspaceModel {
@@ -658,7 +857,7 @@ impl DataLoader {
                             &msg.provider_id,
                             &normalized_model,
                         ),
-                        color_key: model_color_key(group_by, &msg.provider_id, &normalized_model),
+                        color_key: model_color_key(group_by, &msg.provider_id, &model_key),
                         tokens: TokenBreakdown::default(),
                         cost: 0.0,
                         messages: 0,
@@ -748,7 +947,7 @@ impl DataLoader {
                             &msg.provider_id,
                             &normalized_model,
                         ),
-                        color_key: model_color_key(group_by, &msg.provider_id, &normalized_model),
+                        color_key: model_color_key(group_by, &msg.provider_id, &model_key),
                         tokens: TokenBreakdown::default(),
                         cost: 0.0,
                     });
@@ -842,11 +1041,7 @@ impl DataLoader {
                                 &msg.provider_id,
                                 &normalized_model,
                             ),
-                            color_key: model_color_key(
-                                group_by,
-                                &msg.provider_id,
-                                &normalized_model,
-                            ),
+                            color_key: model_color_key(group_by, &msg.provider_id, &model_key),
                             tokens: TokenBreakdown::default(),
                             cost: 0.0,
                         });
@@ -871,6 +1066,180 @@ impl DataLoader {
                     .reasoning
                     .saturating_add(msg.tokens.reasoning.max(0) as u64);
                 m_model.cost += m_cost;
+            }
+
+            // Session aggregation: one bucket per (client, session_id) so the
+            // Sessions tab can show cost/tokens per individual conversation.
+            // Skips messages with an empty session_id (some legacy/scanner
+            // records lack one) rather than lumping them into a single bogus
+            // "no-session" row.
+            if !msg.session_id.is_empty() {
+                let session_key = format!("{}:{}", msg.client, msg.session_id);
+                let session_entry =
+                    session_map
+                        .entry(session_key)
+                        .or_insert_with(|| SessionUsage {
+                            session_id: msg.session_id.clone(),
+                            client: msg.client.clone(),
+                            title: None,
+                            models: Vec::new(),
+                            tokens: TokenBreakdown::default(),
+                            cost: 0.0,
+                            message_count: 0,
+                            turn_count: 0,
+                            first_active_ms: 0,
+                            last_active_ms: 0,
+                        });
+
+                session_entry.tokens.input = session_entry
+                    .tokens
+                    .input
+                    .saturating_add(msg.tokens.input.max(0) as u64);
+                session_entry.tokens.output = session_entry
+                    .tokens
+                    .output
+                    .saturating_add(msg.tokens.output.max(0) as u64);
+                session_entry.tokens.cache_read = session_entry
+                    .tokens
+                    .cache_read
+                    .saturating_add(msg.tokens.cache_read.max(0) as u64);
+                session_entry.tokens.cache_write = session_entry
+                    .tokens
+                    .cache_write
+                    .saturating_add(msg.tokens.cache_write.max(0) as u64);
+                session_entry.tokens.reasoning = session_entry
+                    .tokens
+                    .reasoning
+                    .saturating_add(msg.tokens.reasoning.max(0) as u64);
+                session_entry.cost += msg_cost;
+                session_entry.message_count = session_entry
+                    .message_count
+                    .saturating_add(msg.message_count.max(0) as u32);
+                if msg.is_turn_start {
+                    session_entry.turn_count += 1;
+                }
+
+                let ts = message_timestamp_ms(msg);
+                if ts > 0 {
+                    if session_entry.first_active_ms == 0 || ts < session_entry.first_active_ms {
+                        session_entry.first_active_ms = ts;
+                    }
+                    if ts > session_entry.last_active_ms {
+                        session_entry.last_active_ms = ts;
+                    }
+                }
+
+                // Adopt the first non-empty session_title seen across the
+                // session's messages. Parsers that don't populate the field
+                // leave it `None` and the Sessions tab falls back to the ID.
+                if session_entry.title.is_none() {
+                    if let Some(ref title) = msg.session_title {
+                        let trimmed = title.trim();
+                        if !trimmed.is_empty() {
+                            session_entry.title = Some(trimmed.to_string());
+                        }
+                    }
+                }
+
+                // Track distinct models in first-seen order, retaining
+                // provider and color_key for correct shade-map lookups.
+                if !session_entry
+                    .models
+                    .iter()
+                    .any(|m| m.display_name == normalized_model)
+                {
+                    session_entry.models.push(SessionModel {
+                        display_name: normalized_model.clone(),
+                        provider: msg.provider_id.clone(),
+                        color_key: model_key.clone(),
+                    });
+                }
+            }
+
+            // Project aggregation: one bucket per repo identity so the Projects
+            // tab rolls up per project no matter which global grouping the
+            // Models tab is using. Gated on `projects_enabled` because the
+            // workspace resolution above is only paid when this or the
+            // WorkspaceModel grouping consumes it.
+            if self.projects_enabled {
+                let project_entry =
+                    project_map
+                        .entry(project_group_key.clone())
+                        .or_insert_with(|| ProjectUsage {
+                            group_key: project_group_key.clone(),
+                            workspace_key: project_key.clone(),
+                            label: project_label.clone(),
+                            path: None,
+                            clients: Vec::new(),
+                            models: Vec::new(),
+                            tokens: TokenBreakdown::default(),
+                            cost: 0.0,
+                            message_count: 0,
+                            session_count: 0,
+                            first_active_ms: 0,
+                            last_active_ms: 0,
+                        });
+
+                project_entry.tokens.input = project_entry
+                    .tokens
+                    .input
+                    .saturating_add(msg.tokens.input.max(0) as u64);
+                project_entry.tokens.output = project_entry
+                    .tokens
+                    .output
+                    .saturating_add(msg.tokens.output.max(0) as u64);
+                project_entry.tokens.cache_read = project_entry
+                    .tokens
+                    .cache_read
+                    .saturating_add(msg.tokens.cache_read.max(0) as u64);
+                project_entry.tokens.cache_write = project_entry
+                    .tokens
+                    .cache_write
+                    .saturating_add(msg.tokens.cache_write.max(0) as u64);
+                project_entry.tokens.reasoning = project_entry
+                    .tokens
+                    .reasoning
+                    .saturating_add(msg.tokens.reasoning.max(0) as u64);
+                project_entry.cost += msg_cost;
+                project_entry.message_count = project_entry
+                    .message_count
+                    .saturating_add(msg.message_count.max(0) as u32);
+
+                let ts = message_timestamp_ms(msg);
+                if ts > 0 {
+                    if project_entry.first_active_ms == 0 || ts < project_entry.first_active_ms {
+                        project_entry.first_active_ms = ts;
+                    }
+                    if ts > project_entry.last_active_ms {
+                        project_entry.last_active_ms = ts;
+                    }
+                }
+
+                if !project_entry.clients.iter().any(|c| c == &msg.client) {
+                    project_entry.clients.push(msg.client.clone());
+                }
+
+                if !project_entry
+                    .models
+                    .iter()
+                    .any(|m| m.display_name == normalized_model)
+                {
+                    project_entry.models.push(SessionModel {
+                        display_name: normalized_model.clone(),
+                        provider: msg.provider_id.clone(),
+                        color_key: model_key.clone(),
+                    });
+                }
+
+                if !msg.session_id.is_empty() {
+                    let session_key = format!("{}:{}", msg.client, msg.session_id);
+                    let project_sessions = project_session_ids
+                        .entry(project_group_key.clone())
+                        .or_default();
+                    if project_sessions.insert(session_key) {
+                        project_entry.session_count += 1;
+                    }
+                }
             }
         }
 
@@ -913,7 +1282,36 @@ impl DataLoader {
 
         let monthly = aggregate_monthly_from_daily(&daily);
 
-        let total_tokens: u64 = models.iter().map(|m| m.tokens.total()).sum();
+        let mut sessions: Vec<SessionUsage> = session_map.into_values().collect();
+        sessions.sort_by(|a, b| {
+            b.cost
+                .total_cmp(&a.cost)
+                .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
+                .then_with(|| a.client.cmp(&b.client))
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+
+        let mut projects: Vec<ProjectUsage> = project_map.into_values().collect();
+        // Path resolution is deferred to here so it runs once per distinct
+        // project (memoized in the labeler), not once per message.
+        for project in &mut projects {
+            project.path = workspace_labeler.path(&project.group_key);
+        }
+        projects.sort_by(|a, b| {
+            b.cost
+                .total_cmp(&a.cost)
+                .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
+                .then_with(|| a.label.cmp(&b.label))
+                .then_with(|| a.group_key.cmp(&b.group_key))
+        });
+
+        // Plain `.sum()` panics (debug) / wraps (release) on overflow across
+        // many models; a single corrupt/huge bucket must not poison the
+        // whole total, so fold with saturating_add like `TokenBreakdown::total`.
+        let total_tokens: u64 = models
+            .iter()
+            .map(|m| m.tokens.total())
+            .fold(0u64, u64::saturating_add);
         let total_cost: f64 = models
             .iter()
             .map(|m| if m.cost.is_finite() { m.cost } else { 0.0 })
@@ -929,6 +1327,8 @@ impl DataLoader {
             hourly,
             minutely,
             monthly,
+            sessions,
+            projects,
             graph: Some(graph),
             total_tokens,
             total_cost,
@@ -942,6 +1342,29 @@ impl DataLoader {
 
 fn parse_date(date_str: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()
+}
+
+/// Resolve a message to a Unix-ms timestamp, falling back to the `date`
+/// string's midnight when `timestamp` is missing/zero. Local midnight is
+/// preferred so the date renders on the same calendar day in the user's
+/// timezone. DST edge cases are handled explicitly:
+/// - Fall-back overlap (two valid midnights): take the earliest so the date
+///   stays on the correct day.
+/// - Spring-forward gap (midnight doesn't exist): fall back to UTC midnight
+///   rather than silently returning 0 and losing the session boundary.
+fn message_timestamp_ms(msg: &UnifiedMessage) -> i64 {
+    if msg.timestamp > 0 {
+        return msg.timestamp;
+    }
+    use chrono::TimeZone;
+    parse_date(&msg.date)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| match Local.from_local_datetime(&dt) {
+            chrono::LocalResult::Single(local) => local.timestamp_millis(),
+            chrono::LocalResult::Ambiguous(earliest, _) => earliest.timestamp_millis(),
+            chrono::LocalResult::None => dt.and_utc().timestamp_millis(),
+        })
+        .unwrap_or(0)
 }
 
 /// Convert Unix ms timestamp to a NaiveDateTime truncated to the hour (local tz).
@@ -1317,7 +1740,7 @@ mod tests {
         include_synthetic: bool,
         pricing: Option<&PricingService>,
     ) -> Result<UsageData> {
-        let home = dirs::home_dir()
+        let home = crate::paths::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
             .to_string_lossy()
             .to_string();
@@ -1445,109 +1868,90 @@ mod tests {
         assert_eq!(clients[34], ClientId::OpenCodeReview);
         assert_eq!(clients[35], ClientId::CodeBuddy);
         assert_eq!(clients[36], ClientId::WorkBuddy);
+        assert_eq!(clients[37], ClientId::DevinCli);
+        assert_eq!(clients[38], ClientId::DevinDesktop);
+        assert_eq!(clients[39], ClientId::Senpi);
+        assert_eq!(clients[40], ClientId::Augment);
+        assert_eq!(clients[41], ClientId::Kimchi);
+        assert_eq!(clients[42], ClientId::Reasonix);
+        assert_eq!(clients[43], ClientId::PrimeAgent);
+        assert_eq!(clients[44], ClientId::Freebuff);
+        assert_eq!(clients[45], ClientId::CherryStudio);
+        assert_eq!(clients[46], ClientId::Dsh);
+        assert_eq!(clients[47], ClientId::Mcode);
+        assert_eq!(clients[48], ClientId::Fx);
+        assert_eq!(clients[49], ClientId::Omp);
+        assert_eq!(clients[50], ClientId::LmStudio);
+        assert_eq!(clients[51], ClientId::Unsloth);
+        assert_eq!(clients[52], ClientId::Hindsight);
+        assert_eq!(clients[53], ClientId::MiMoDesktop);
+        assert_eq!(clients[54], ClientId::Muse);
     }
 
     #[test]
-    fn test_client_as_str() {
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::OpenCode),
-            "OpenCode"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Claude),
-            "Claude"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Codex),
-            "Codex"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Copilot),
-            "Copilot"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Cursor),
-            "Cursor"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Gemini),
-            "Gemini"
-        );
-        assert_eq!(crate::tui::client_ui::display_name(ClientId::Amp), "Amp");
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Droid),
-            "Droid"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::OpenClaw),
-            "OpenClaw"
-        );
-        assert_eq!(crate::tui::client_ui::display_name(ClientId::Pi), "Pi");
-        assert_eq!(crate::tui::client_ui::display_name(ClientId::Kimi), "Kimi");
-        assert_eq!(crate::tui::client_ui::display_name(ClientId::Qwen), "Qwen");
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::RooCode),
-            "Roo Code"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::KiloCode),
-            "KiloCode"
-        );
-        assert_eq!(crate::tui::client_ui::display_name(ClientId::Mux), "Mux");
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Kilo),
-            "Kilo CLI"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Crush),
-            "Crush"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Hermes),
-            "Hermes Agent"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Codebuff),
-            "Codebuff"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Antigravity),
-            "Antigravity"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Zed),
-            "Zed Agent"
-        );
-        assert_eq!(crate::tui::client_ui::display_name(ClientId::Kiro), "Kiro");
-        assert_eq!(crate::tui::client_ui::display_name(ClientId::Trae), "Trae");
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Cline),
-            "Cline"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Grok),
-            "Grok Build"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Jcode),
-            "Jcode"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::AntigravityCli),
-            "Antigravity CLI"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::Junie),
-            "Junie"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::CodeBuddy),
-            "CodeBuddy"
-        );
-        assert_eq!(
-            crate::tui::client_ui::display_name(ClientId::WorkBuddy),
-            "WorkBuddy"
-        );
+    fn test_client_display_names_match_canonical_registry() {
+        let expected = [
+            "OpenCode",
+            "Claude Code",
+            "Codex CLI",
+            "Cursor IDE",
+            "Gemini CLI",
+            "Amp",
+            "Droid",
+            "OpenClaw",
+            "Pi",
+            "Kimi CLI",
+            "Qwen CLI",
+            "Roo Code",
+            "Kilo Code",
+            "Mux",
+            "Kilo CLI",
+            "Crush",
+            "Hermes Agent",
+            "Copilot CLI",
+            "Goose",
+            "Codebuff",
+            "Antigravity",
+            "Zed Agent",
+            "Kiro",
+            "Trae",
+            "Warp",
+            "Cline",
+            "Gajae-Code",
+            "Grok Build",
+            "Jcode",
+            "Command Code",
+            "MiMo Code",
+            "Antigravity CLI",
+            "Junie",
+            "ZCode",
+            "OpenCodeReview",
+            "CodeBuddy",
+            "WorkBuddy",
+            "Devin CLI",
+            "Devin Desktop",
+            "Senpi (OmO Native)",
+            "Augment Code",
+            "Kimchi",
+            "Reasonix",
+            "Prime Agent",
+            "Freebuff",
+            "Cherry Studio",
+            "DeepSeek Harness",
+            "MiniMax Code",
+            "Fx",
+            "Oh My Pi",
+            "LM Studio",
+            "Unsloth",
+            "Hindsight",
+            "Xiaomi MiMo AI",
+            "Muse Code",
+        ];
+
+        assert_eq!(expected.len(), ClientId::COUNT);
+        for (client, expected_name) in ClientId::iter().zip(expected) {
+            assert_eq!(crate::tui::client_ui::display_name(client), expected_name);
+        }
     }
 
     #[test]
@@ -1583,6 +1987,17 @@ mod tests {
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Junie), 'p');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::CodeBuddy), 'C');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::WorkBuddy), 'B');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Augment), 'A');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Kimchi), 'K');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::PrimeAgent), 'P');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Mcode), 'M');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Fx), 'X');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Omp), 'Y');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::LmStudio), 'L');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Unsloth), 'U');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Hindsight), 'H');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::MiMoDesktop), 'W');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Muse), 'N');
     }
 
     #[test]
@@ -1690,6 +2105,18 @@ mod tests {
         assert_eq!(
             crate::tui::client_ui::from_hotkey('B'),
             Some(ClientId::WorkBuddy)
+        );
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('A'),
+            Some(ClientId::Augment)
+        );
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('K'),
+            Some(ClientId::Kimchi)
+        );
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('P'),
+            Some(ClientId::PrimeAgent)
         );
     }
 
@@ -1866,6 +2293,40 @@ mod tests {
     }
 
     #[test]
+    fn total_tokens_saturates_across_corrupt_model_buckets() {
+        let loader = DataLoader::new(None);
+        // Three distinct models each carrying i64::MAX input tokens: no
+        // single model bucket overflows (TokenBreakdown::total saturates
+        // internally), but summing three of them plainly overflows u64.
+        let messages: Vec<UnifiedMessage> = (0..3)
+            .map(|i| {
+                UnifiedMessage::new(
+                    "claude",
+                    format!("model-{i}"),
+                    "anthropic",
+                    format!("session-{i}"),
+                    1_735_689_600_000,
+                    tokscale_core::TokenBreakdown {
+                        input: i64::MAX,
+                        output: 0,
+                        cache_read: 0,
+                        cache_write: 0,
+                        reasoning: 0,
+                    },
+                    0.0,
+                )
+            })
+            .collect();
+
+        let usage = loader
+            .aggregate_messages(messages, &GroupBy::Model)
+            .unwrap();
+
+        assert_eq!(usage.models.len(), 3);
+        assert_eq!(usage.total_tokens, u64::MAX);
+    }
+
+    #[test]
     fn test_aggregate_messages_groups_by_workspace_and_model() {
         let loader = DataLoader::new(None);
         let usage = loader
@@ -1901,6 +2362,522 @@ mod tests {
         assert_eq!(usage.models[0].client, "claude, qwen");
         assert_eq!(usage.models[0].session_count, 2);
         assert_eq!(usage.models[0].cost, 4.0);
+    }
+
+    #[test]
+    fn test_aggregate_messages_projects_roll_up_by_workspace_under_any_grouping() {
+        let loader = DataLoader::new(None).with_projects_enabled(true);
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    make_workspace_message(
+                        "claude",
+                        "claude-sonnet-4-5-20250929",
+                        "anthropic",
+                        "session-1",
+                        1.25,
+                        Some("/repo-a"),
+                        Some("repo-a"),
+                    ),
+                    make_workspace_message(
+                        "qwen",
+                        "kimi-k2",
+                        "moonshot",
+                        "session-2",
+                        2.75,
+                        Some("/repo-a"),
+                        Some("repo-a"),
+                    ),
+                    make_workspace_message(
+                        "claude",
+                        "claude-sonnet-4-5-20250929",
+                        "anthropic",
+                        "session-3",
+                        5.0,
+                        Some("/repo-b"),
+                        Some("repo-b"),
+                    ),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert_eq!(usage.projects.len(), 2);
+        // Default order is cost descending.
+        let first = &usage.projects[0];
+        assert_eq!(first.group_key, "/repo-b");
+        assert_eq!(first.label, "repo-b");
+        assert_eq!(first.workspace_key.as_deref(), Some("/repo-b"));
+        assert_eq!(first.cost, 5.0);
+        assert_eq!(first.session_count, 1);
+        assert_eq!(first.clients, vec!["claude".to_string()]);
+
+        let second = &usage.projects[1];
+        assert_eq!(second.group_key, "/repo-a");
+        assert_eq!(second.cost, 4.0);
+        assert_eq!(second.session_count, 2);
+        // Clients and models track first-seen order across sources.
+        assert_eq!(
+            second.clients,
+            vec!["claude".to_string(), "qwen".to_string()]
+        );
+        let model_names: Vec<_> = second
+            .models
+            .iter()
+            .map(|m| m.display_name.as_str())
+            .collect();
+        assert_eq!(model_names, vec!["claude-sonnet-4-5", "kimi-k2"]);
+        assert_eq!(second.tokens.total(), 30);
+        assert_eq!(second.message_count, 2);
+        assert!(second.first_active_ms > 0);
+        assert_eq!(second.first_active_ms, second.last_active_ms);
+    }
+
+    #[test]
+    fn codex_chat_workspace_requires_the_dated_chat_layout() {
+        for key in [
+            "/Users/alice/Documents/Codex/2026-09-05/ni-shi",
+            "/home/alice/Documents/Codex/2026-09-06/new-chat",
+            "C:/Users/alice/Documents/Codex/2026-09-06/chat",
+        ] {
+            assert!(is_codex_chat_workspace(key), "{key}");
+        }
+        for key in [
+            "/Users/alice/Projects/Codex/2026-09-05/chat",
+            "/Users/alice/Documents/Codex/my-project",
+            "/Users/alice/Documents/Codex/2026-09-05",
+            "/Users/alice/Documents/Codex/2026-09-05/",
+            "/Users/alice/Documents/Codex/2026-02-30/chat",
+            "/Users/alice/Documents/Codex/2026-9-05/chat",
+            "/Users/alice/Documents/Codex/2026-09-05/..",
+            "/Users/alice/Documents/Codex/2026-09-05/chat/nested-project",
+        ] {
+            assert!(!is_codex_chat_workspace(key), "{key}");
+        }
+
+        let dir = TempDir::new().unwrap();
+        for (name, is_worktree) in [("repo", false), ("worktree", true)] {
+            let path = dir.path().join("Documents/Codex/2026-09-05").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            if is_worktree {
+                std::fs::write(path.join(".git"), "gitdir: /repo/.git/worktrees/chat").unwrap();
+            } else {
+                std::fs::create_dir(path.join(".git")).unwrap();
+            }
+            let key = sessions::normalize_workspace_key(&path.to_string_lossy()).unwrap();
+            assert!(!is_codex_chat_workspace(&key), "{key}");
+        }
+    }
+
+    #[test]
+    fn test_aggregate_messages_projects_merge_codex_chats_without_changing_usage() {
+        let chat_a = "/Users/alice/Documents/Codex/2026-09-05/ni-shi";
+        let chat_b = "/Users/alice/Documents/Codex/2026-09-06/new-chat";
+        let mut messages: Vec<_> = [
+            ("codex", "gpt-5.5", "chat-1", 1.0, Some(chat_a)),
+            ("codex", "gpt-5.5", "chat-1", 2.0, Some(chat_a)),
+            ("codex", "gpt-6-astra", "chat-2", 4.0, Some(chat_b)),
+            ("codex", "gpt-5.5", "repo", 8.0, Some("/repo")),
+            (
+                "claude",
+                "claude-opus-5",
+                "other-client",
+                16.0,
+                Some(chat_a),
+            ),
+            ("codex", "gpt-5.5", "unknown", 32.0, None),
+            (
+                "codex",
+                "gpt-5.5",
+                "same-name",
+                64.0,
+                Some("/real/Codex Chat"),
+            ),
+        ]
+        .into_iter()
+        .map(|(client, model, session, cost, workspace)| {
+            make_workspace_message(client, model, "openai", session, cost, workspace, None)
+        })
+        .collect();
+        messages[0].tokens.cache_read = 20;
+        messages[0].tokens.cache_write = 2;
+        messages[0].tokens.reasoning = 1;
+        messages[2].timestamp += 60_000;
+
+        for grouping in [
+            GroupBy::Model,
+            GroupBy::ClientModel,
+            GroupBy::WorkspaceModel,
+        ] {
+            let baseline = DataLoader::new(None)
+                .aggregate_messages(messages.clone(), &grouping)
+                .unwrap();
+            let usage = DataLoader::new(None)
+                .with_projects_enabled(true)
+                .aggregate_messages(messages.clone(), &grouping)
+                .unwrap();
+
+            assert_eq!(usage.projects.len(), 5);
+            let chat = usage
+                .projects
+                .iter()
+                .find(|p| p.label == CODEX_CHAT_LABEL)
+                .unwrap();
+            assert_eq!(chat.group_key, CODEX_CHAT_GROUP_KEY);
+            assert_eq!(chat.workspace_key, None);
+            assert_eq!(chat.path, None);
+            assert_eq!(chat.session_count, 2);
+            assert_eq!(chat.message_count, 3);
+            assert_eq!(chat.clients, ["codex"]);
+            assert_eq!(chat.models.len(), 2);
+            assert_eq!(chat.cost, 7.0);
+            assert_eq!(chat.tokens.input, 30);
+            assert_eq!(chat.tokens.output, 15);
+            assert_eq!(chat.tokens.cache_read, 20);
+            assert_eq!(chat.tokens.cache_write, 2);
+            assert_eq!(chat.tokens.reasoning, 1);
+            assert_eq!(chat.first_active_ms, messages[0].timestamp);
+            assert_eq!(chat.last_active_ms, messages[2].timestamp);
+
+            let same_name = usage
+                .projects
+                .iter()
+                .find(|p| p.group_key == "/real/Codex Chat")
+                .unwrap();
+            assert_eq!(same_name.label, "/real/Codex Chat");
+            assert_eq!(same_name.cost, 64.0);
+            let other_client = usage
+                .projects
+                .iter()
+                .find(|p| p.group_key == chat_a)
+                .unwrap();
+            assert_eq!(other_client.label, "ni-shi");
+            assert_eq!(other_client.clients, ["claude"]);
+            assert_eq!(other_client.cost, 16.0);
+            assert!(usage
+                .projects
+                .iter()
+                .any(|p| p.label == UNKNOWN_WORKSPACE_LABEL));
+
+            assert_eq!(usage.total_tokens, baseline.total_tokens);
+            assert_eq!(usage.total_cost, baseline.total_cost);
+            assert_eq!(usage.sessions.len(), baseline.sessions.len());
+            assert_eq!(usage.models.len(), baseline.models.len());
+            assert_eq!(
+                usage.projects.iter().map(|p| p.tokens.total()).sum::<u64>(),
+                usage.total_tokens
+            );
+            assert_eq!(
+                usage.projects.iter().map(|p| p.cost).sum::<f64>(),
+                usage.total_cost
+            );
+            if grouping == GroupBy::WorkspaceModel {
+                assert!(usage
+                    .models
+                    .iter()
+                    .any(|m| m.workspace_key.as_deref() == Some(chat_b)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_aggregate_messages_projects_empty_unless_enabled() {
+        let loader = DataLoader::new(None);
+        let usage = loader
+            .aggregate_messages(
+                vec![make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-1",
+                    1.0,
+                    Some("/repo-a"),
+                    Some("repo-a"),
+                )],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert!(usage.projects.is_empty());
+    }
+
+    #[test]
+    fn test_aggregate_messages_projects_keeps_unknown_workspace_bucket() {
+        let loader = DataLoader::new(None).with_projects_enabled(true);
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    make_workspace_message(
+                        "claude",
+                        "claude-sonnet-4-5-20250929",
+                        "anthropic",
+                        "session-1",
+                        1.0,
+                        None,
+                        None,
+                    ),
+                    make_workspace_message(
+                        "claude",
+                        "claude-sonnet-4-5-20250929",
+                        "anthropic",
+                        "session-2",
+                        2.0,
+                        Some("/repo-a"),
+                        Some("repo-a"),
+                    ),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert_eq!(usage.projects.len(), 2);
+        assert!(usage.projects.iter().any(|project| {
+            project.workspace_key.is_none()
+                && project.label == UNKNOWN_WORKSPACE_LABEL
+                && (project.cost - 1.0).abs() < f64::EPSILON
+        }));
+        assert!(usage.projects.iter().any(|project| {
+            project.workspace_key.as_deref() == Some("/repo-a")
+                && project.label == "repo-a"
+                && (project.cost - 2.0).abs() < f64::EPSILON
+        }));
+    }
+
+    #[test]
+    fn test_aggregate_messages_projects_merge_path_and_claude_slug() {
+        // Codex records the real path; Claude Code records the dash-mangled
+        // slug. Both describe the same directory, so the Projects tab (repo
+        // identity) must land them in one row.
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join("my-proj");
+        std::fs::create_dir(&project).unwrap();
+        let canonical = std::fs::canonicalize(&project).unwrap();
+        // Windows canonical paths have a verbatim prefix that is not part of
+        // Claude Code's drive-rooted workspace slug.
+        let canonical = canonical.to_string_lossy();
+        let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+        let real_key = tokscale_core::sessions::normalize_workspace_key(canonical).unwrap();
+        let slug: String = real_key
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+
+        let loader = DataLoader::new(None).with_projects_enabled(true);
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    make_workspace_message(
+                        "codex",
+                        "gpt-5.5",
+                        "openai",
+                        "session-1",
+                        1.0,
+                        Some(&real_key),
+                        None,
+                    ),
+                    make_workspace_message(
+                        "claude",
+                        "claude-opus-5",
+                        "anthropic",
+                        "session-2",
+                        2.0,
+                        Some(&slug),
+                        None,
+                    ),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert_eq!(usage.projects.len(), 1);
+        let project = &usage.projects[0];
+        assert_eq!(project.group_key, real_key);
+        assert_eq!(project.label, "my-proj");
+        assert_eq!(project.cost, 3.0);
+        assert_eq!(project.session_count, 2);
+        assert_eq!(
+            project.clients,
+            vec!["codex".to_string(), "claude".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_aggregate_messages_projects_keep_an_ambiguous_claude_slug_separate() {
+        // `a-b` and `a.b` encode to the same Claude Code slug, so with both on
+        // disk the slug is evidence for neither. Merging it into whichever one
+        // the decoder prefers moves that usage onto a project it may never have
+        // touched, and every total still reconciles, so nothing else catches it.
+        let dir = TempDir::new().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let canonical = canonical.to_string_lossy();
+        let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+        let root = tokscale_core::sessions::normalize_workspace_key(canonical).unwrap();
+        let dashed = format!("{root}/a-b");
+        let dotted = format!("{root}/a.b");
+        std::fs::create_dir(&dashed).unwrap();
+        std::fs::create_dir(&dotted).unwrap();
+        let slug_of = |key: &str| -> String {
+            key.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect()
+        };
+        let slug = slug_of(&dotted);
+        assert_eq!(slug, slug_of(&dashed));
+
+        let loader = DataLoader::new(None).with_projects_enabled(true);
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    make_workspace_message(
+                        "codex",
+                        "gpt-5.5",
+                        "openai",
+                        "session-1",
+                        1.0,
+                        Some(&dashed),
+                        None,
+                    ),
+                    make_workspace_message(
+                        "codex",
+                        "gpt-5.5",
+                        "openai",
+                        "session-2",
+                        2.0,
+                        Some(&dotted),
+                        None,
+                    ),
+                    make_workspace_message(
+                        "claude",
+                        "claude-opus-5",
+                        "anthropic",
+                        "session-3",
+                        10.0,
+                        Some(&slug),
+                        None,
+                    ),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert_eq!(usage.projects.len(), 3);
+        let by_key = |key: &str| {
+            usage
+                .projects
+                .iter()
+                .find(|p| p.group_key == key)
+                .unwrap_or_else(|| panic!("no project row for {key}"))
+        };
+        assert_eq!(by_key(&dashed).cost, 1.0);
+        assert_eq!(by_key(&dashed).clients, ["codex"]);
+        assert_eq!(by_key(&dotted).cost, 2.0);
+        assert_eq!(by_key(&dotted).clients, ["codex"]);
+        // The slug keeps its own row, and does not claim a path it cannot prove.
+        let ambiguous = by_key(&slug);
+        assert_eq!(ambiguous.cost, 10.0);
+        assert_eq!(ambiguous.clients, ["claude"]);
+        assert_eq!(ambiguous.path, None);
+        assert_eq!(
+            usage.projects.iter().map(|p| p.cost).sum::<f64>(),
+            usage.total_cost
+        );
+    }
+
+    #[test]
+    fn test_aggregate_messages_projects_keep_a_nested_ambiguous_claude_slug_separate() {
+        // The sibling case above is the shallow shape. Here `a-b/c`, `a/b-c` and
+        // `a/b.c` share one slug, and the tie is found a level below `a`, after
+        // `a-b/c` has already completed. The decoder used to report that deeper
+        // tie as a dead end, so the slug decoded to `a-b/c` and the Claude Code
+        // usage merged into it: 3 rows, `a-b/c` at $11, and every total still
+        // reconciled.
+        let dir = TempDir::new().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let canonical = canonical.to_string_lossy();
+        let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+        let root = tokscale_core::sessions::normalize_workspace_key(canonical).unwrap();
+        let outer = format!("{root}/a-b/c");
+        let dashed = format!("{root}/a/b-c");
+        let dotted = format!("{root}/a/b.c");
+        for path in [&outer, &dashed, &dotted] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let slug_of = |key: &str| -> String {
+            key.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect()
+        };
+        let slug = slug_of(&dotted);
+        assert_eq!(slug, slug_of(&dashed));
+        assert_eq!(slug, slug_of(&outer));
+
+        let loader = DataLoader::new(None).with_projects_enabled(true);
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    make_workspace_message(
+                        "codex",
+                        "gpt-5.5",
+                        "openai",
+                        "session-1",
+                        1.0,
+                        Some(&outer),
+                        None,
+                    ),
+                    make_workspace_message(
+                        "codex",
+                        "gpt-5.5",
+                        "openai",
+                        "session-2",
+                        2.0,
+                        Some(&dashed),
+                        None,
+                    ),
+                    make_workspace_message(
+                        "codex",
+                        "gpt-5.5",
+                        "openai",
+                        "session-3",
+                        4.0,
+                        Some(&dotted),
+                        None,
+                    ),
+                    make_workspace_message(
+                        "claude",
+                        "claude-opus-5",
+                        "anthropic",
+                        "session-4",
+                        10.0,
+                        Some(&slug),
+                        None,
+                    ),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert_eq!(usage.projects.len(), 4);
+        let by_key = |key: &str| {
+            usage
+                .projects
+                .iter()
+                .find(|p| p.group_key == key)
+                .unwrap_or_else(|| panic!("no project row for {key}"))
+        };
+        assert_eq!(by_key(&outer).cost, 1.0);
+        assert_eq!(by_key(&outer).clients, ["codex"]);
+        assert_eq!(by_key(&dashed).cost, 2.0);
+        assert_eq!(by_key(&dashed).clients, ["codex"]);
+        assert_eq!(by_key(&dotted).cost, 4.0);
+        assert_eq!(by_key(&dotted).clients, ["codex"]);
+        let ambiguous = by_key(&slug);
+        assert_eq!(ambiguous.cost, 10.0);
+        assert_eq!(ambiguous.clients, ["claude"]);
+        assert_eq!(ambiguous.path, None);
+        assert_eq!(
+            usage.projects.iter().map(|p| p.cost).sum::<f64>(),
+            usage.total_cost
+        );
     }
 
     #[test]
@@ -2065,21 +3042,50 @@ mod tests {
         let claude = usage.daily[0].source_breakdown.get("claude").unwrap();
         assert_eq!(claude.models.len(), 2);
 
-        // Keys must differ even though display names are identical
+        // Keys must differ...
         let daily_keys: Vec<_> = claude.models.keys().cloned().collect();
         assert_eq!(daily_keys.len(), 2);
         assert_ne!(daily_keys[0], daily_keys[1]);
 
-        let display_names: Vec<_> = claude
+        // ...and so must the names, or the chart legend has two entries the
+        // reader cannot tell apart. Both directories are named `demo`, so the
+        // qualifier has to come from their parents.
+        let mut display_names: Vec<_> = claude
             .models
             .values()
             .map(|info| info.display_name.clone())
             .collect();
+        display_names.sort();
         assert_eq!(
             display_names,
             vec![
-                "demo / claude-sonnet-4-5".to_string(),
-                "demo / claude-sonnet-4-5".to_string()
+                "team-a/demo / claude-sonnet-4-5".to_string(),
+                "team-b/demo / claude-sonnet-4-5".to_string()
+            ]
+        );
+
+        let mut workspace_labels: Vec<_> = usage
+            .models
+            .iter()
+            .filter_map(|model| model.workspace_label.clone())
+            .collect();
+        workspace_labels.sort();
+        assert_eq!(
+            workspace_labels,
+            vec!["team-a/demo".to_string(), "team-b/demo".to_string()]
+        );
+        // The grouping identity is still the raw key.
+        let mut workspace_keys: Vec<_> = usage
+            .models
+            .iter()
+            .filter_map(|model| model.workspace_key.clone())
+            .collect();
+        workspace_keys.sort();
+        assert_eq!(
+            workspace_keys,
+            vec![
+                "/srv/team-a/demo".to_string(),
+                "/srv/team-b/demo".to_string()
             ]
         );
     }
@@ -2617,6 +3623,85 @@ after"#,
             },
             cost,
         )
+    }
+
+    /// The Sessions tab's Model column reads `SessionUsage.models`. Each entry
+    /// keeps the provider and color key its family-shade lookup needs, and the
+    /// list is deduped by display name so a model reached under two spellings
+    /// (here a dated id and its normalized form) lands once, in first-seen order.
+    ///
+    /// The dedup below relies on `model_name_for_grouping` ignoring `provider_id`
+    /// for this input: it consults the provider only when `client == "opencode"`
+    /// (to apply an OpenCode-configured label), and every other client falls
+    /// through to `normalize_model_for_grouping`, which is a pure function of the
+    /// model id. That is why the third message can carry a different provider
+    /// (`github-copilot` vs `anthropic`) and still collapse onto the same display
+    /// name. If that scoping ever widens beyond OpenCode, this assertion is the
+    /// one that should start failing.
+    #[test]
+    fn test_session_models_dedup_by_display_name_and_retain_provider() {
+        let loader = DataLoader::new(None);
+        let base_ms = 1_735_689_600_000_i64;
+        let tokens = || tokscale_core::TokenBreakdown {
+            input: 10,
+            output: 5,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    UnifiedMessage::new(
+                        "claude",
+                        "claude-sonnet-4-5-20250929",
+                        "anthropic",
+                        "session-1",
+                        base_ms,
+                        tokens(),
+                        1.0,
+                    ),
+                    UnifiedMessage::new(
+                        "claude",
+                        "gpt-5",
+                        "openai",
+                        "session-1",
+                        base_ms + 1_000,
+                        tokens(),
+                        1.0,
+                    ),
+                    // Same model as the first message, spelled without the date
+                    // and served through a gateway: must not add a second entry.
+                    UnifiedMessage::new(
+                        "claude",
+                        "claude-sonnet-4-5",
+                        "github-copilot",
+                        "session-1",
+                        base_ms + 2_000,
+                        tokens(),
+                        1.0,
+                    ),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert_eq!(usage.sessions.len(), 1, "expected a single session bucket");
+        assert_eq!(
+            usage.sessions[0].models,
+            vec![
+                SessionModel {
+                    display_name: "claude-sonnet-4-5".to_string(),
+                    provider: "anthropic".to_string(),
+                    color_key: "claude-sonnet-4-5".to_string(),
+                },
+                SessionModel {
+                    display_name: "gpt-5".to_string(),
+                    provider: "openai".to_string(),
+                    color_key: "gpt-5".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

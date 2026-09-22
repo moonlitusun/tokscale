@@ -20,7 +20,7 @@ use super::codex_login::{
 };
 use super::data::{
     AgentUsage, DailyUsage, DataLoader, HourlyUsage, MinutelyUsage, ModelUsage, MonthlyUsage,
-    TokenBreakdown, UsageData,
+    ProjectUsage, SessionUsage, TokenBreakdown, UsageData,
 };
 use super::privacy::looks_like_email;
 use super::settings::Settings;
@@ -29,6 +29,7 @@ use super::ui::dialog::{ClientPickerDialog, ConfirmDialog, DialogStack};
 use super::ui::widgets::{get_model_color, get_provider_from_model, get_provider_shade};
 
 /// Configuration for TUI initialization
+#[derive(Default)]
 pub struct TuiConfig {
     pub theme: String,
     pub refresh: u64,
@@ -38,6 +39,9 @@ pub struct TuiConfig {
     pub until: Option<String>,
     pub year: Option<String>,
     pub initial_tab: Option<Tab>,
+    /// Initial worktree rollup, so `--merge-worktrees` survives into an
+    /// interactive launch instead of being dropped. `w` toggles it from here.
+    pub worktree_rollup: tokscale_core::WorktreeRollup,
 }
 
 #[cfg(not(test))]
@@ -61,6 +65,8 @@ pub enum Tab {
     Hourly,
     Minutely,
     Monthly,
+    Sessions,
+    Projects,
     Stats,
     Agents,
 }
@@ -75,6 +81,8 @@ impl Tab {
             Tab::Hourly,
             Tab::Minutely,
             Tab::Monthly,
+            Tab::Sessions,
+            Tab::Projects,
             Tab::Stats,
             Tab::Agents,
         ]
@@ -89,6 +97,8 @@ impl Tab {
             Tab::Hourly => "Hourly",
             Tab::Minutely => "Minutely",
             Tab::Monthly => "Monthly",
+            Tab::Sessions => "Sessions",
+            Tab::Projects => "Projects",
             Tab::Stats => "Stats",
             Tab::Agents => "Agents",
         }
@@ -103,6 +113,8 @@ impl Tab {
             Tab::Hourly => "Hr",
             Tab::Minutely => "Min",
             Tab::Monthly => "Mon",
+            Tab::Sessions => "Ses",
+            Tab::Projects => "Prj",
             Tab::Stats => "Sta",
             Tab::Agents => "Agt",
         }
@@ -116,7 +128,9 @@ impl Tab {
             Tab::Daily => Tab::Hourly,
             Tab::Hourly => Tab::Minutely,
             Tab::Minutely => Tab::Monthly,
-            Tab::Monthly => Tab::Stats,
+            Tab::Monthly => Tab::Sessions,
+            Tab::Sessions => Tab::Projects,
+            Tab::Projects => Tab::Stats,
             Tab::Stats => Tab::Agents,
             Tab::Agents => Tab::Overview,
         }
@@ -131,7 +145,9 @@ impl Tab {
             Tab::Hourly => Tab::Daily,
             Tab::Minutely => Tab::Hourly,
             Tab::Monthly => Tab::Minutely,
-            Tab::Stats => Tab::Monthly,
+            Tab::Sessions => Tab::Monthly,
+            Tab::Projects => Tab::Sessions,
+            Tab::Stats => Tab::Projects,
             Tab::Agents => Tab::Stats,
         }
     }
@@ -298,6 +314,9 @@ pub struct App {
     /// at the boundary via `App::scan_clients` and `App::include_synthetic`.
     pub enabled_clients: Rc<RefCell<HashSet<ClientFilter>>>,
     pub group_by: Rc<RefCell<tokscale_core::GroupBy>>,
+    /// Whether workspace rows fold git worktrees into their parent repo. Toggled
+    /// with `w`; only observable under `GroupBy::WorkspaceModel`.
+    pub worktree_rollup: tokscale_core::WorktreeRollup,
     pub sort_field: SortField,
     pub sort_direction: SortDirection,
     tab_sort_state: HashMap<Tab, (SortField, SortDirection)>,
@@ -389,7 +408,11 @@ impl App {
                 .parse()
                 .unwrap_or_else(|_| settings.theme_name())
         };
-        let theme = Theme::from_name_for_current_terminal(theme_name);
+        let theme = if settings.tui_light_mode {
+            Theme::from_name_for_current_terminal_light(theme_name)
+        } else {
+            Theme::from_name_for_current_terminal(theme_name)
+        };
 
         let enabled_clients: HashSet<ClientFilter> = if let Some(ref cli_clients) = config.clients {
             // CLI-provided filter list. Each entry is the canonical
@@ -451,6 +474,7 @@ impl App {
             data_loader,
             enabled_clients: Rc::new(RefCell::new(enabled_clients)),
             group_by: Rc::new(RefCell::new(super::cache::TUI_DEFAULT_GROUP_BY)),
+            worktree_rollup: config.worktree_rollup,
             sort_field,
             sort_direction,
             tab_sort_state: HashMap::new(),
@@ -854,6 +878,11 @@ impl App {
             KeyCode::Char('p') => {
                 self.cycle_theme();
             }
+            KeyCode::Char('l') | KeyCode::Char('L')
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.toggle_light_mode();
+            }
             KeyCode::Char('r') => {
                 self.last_auto_refresh = Instant::now();
                 if self.current_tab == Tab::Usage {
@@ -897,6 +926,23 @@ impl App {
             }
             KeyCode::Char('g') => {
                 self.open_group_by_picker();
+            }
+            // Only meaningful while workspace rows are on screen; leaving `w`
+            // inert elsewhere keeps it free for other tabs later.
+            KeyCode::Char('w')
+                if *self.group_by.borrow() == tokscale_core::GroupBy::WorkspaceModel =>
+            {
+                self.worktree_rollup = match self.worktree_rollup {
+                    tokscale_core::WorktreeRollup::Separate => {
+                        tokscale_core::WorktreeRollup::MergeIntoRepo
+                    }
+                    tokscale_core::WorktreeRollup::MergeIntoRepo => {
+                        tokscale_core::WorktreeRollup::Separate
+                    }
+                };
+                // Rollup changes the grouping key, so rows must be rebuilt.
+                self.needs_reload = true;
+                self.reset_selection();
             }
             KeyCode::Char('a') if self.current_tab == Tab::Usage => {
                 self.start_codex_login();
@@ -1604,7 +1650,10 @@ impl App {
     }
 
     fn default_sort_for_tab(tab: Tab) -> (SortField, SortDirection) {
-        if matches!(tab, Tab::Hourly | Tab::Minutely | Tab::Monthly) {
+        if matches!(
+            tab,
+            Tab::Hourly | Tab::Minutely | Tab::Monthly | Tab::Sessions
+        ) {
             (SortField::Date, SortDirection::Descending)
         } else {
             (SortField::Cost, SortDirection::Descending)
@@ -1764,6 +1813,8 @@ impl App {
                 self.get_sorted_monthly_detail_days().len()
             }
             Tab::Monthly => self.data.monthly.len(),
+            Tab::Sessions => self.data.sessions.len(),
+            Tab::Projects => self.data.projects.len(),
             Tab::Stats => {
                 if self.selected_graph_cell.is_some() {
                     self.stats_breakdown_total_lines
@@ -1840,10 +1891,14 @@ impl App {
 
     fn cycle_theme(&mut self) {
         let new_theme = self.theme.name.next();
-        self.theme = Theme::from_name_for_current_terminal(new_theme);
+        self.theme = if self.settings.tui_light_mode {
+            Theme::from_name_for_current_terminal_light(new_theme)
+        } else {
+            Theme::from_name_for_current_terminal(new_theme)
+        };
         self.dialog_stack.set_theme(self.theme.clone());
         self.settings.set_theme(new_theme);
-        if let Err(e) = self.settings.save() {
+        if let Err(e) = Settings::update_and_save("colorPalette", new_theme.as_str()) {
             self.set_status(&format!(
                 "Theme: {} (save failed: {})",
                 new_theme.as_str(),
@@ -1851,6 +1906,27 @@ impl App {
             ));
         } else {
             self.set_status(&format!("Theme: {}", new_theme.as_str()));
+        }
+    }
+    fn toggle_light_mode(&mut self) {
+        self.settings.tui_light_mode = !self.settings.tui_light_mode;
+        let light_mode = self.settings.tui_light_mode;
+        let name = self.theme.name;
+        self.theme = if self.settings.tui_light_mode {
+            Theme::from_name_for_current_terminal_light(name)
+        } else {
+            Theme::from_name_for_current_terminal(name)
+        };
+        self.dialog_stack.set_theme(self.theme.clone());
+        let state = if self.settings.tui_light_mode {
+            "on"
+        } else {
+            "off"
+        };
+        if let Err(e) = Settings::update_and_save("tuiLightMode", light_mode) {
+            self.set_status(&format!("Light mode: {} (save failed: {})", state, e));
+        } else {
+            self.set_status(&format!("Light mode: {}", state));
         }
     }
 
@@ -2003,7 +2079,7 @@ impl App {
             self.last_auto_refresh = Instant::now();
         }
         self.settings.auto_refresh_enabled = self.auto_refresh;
-        let save_result = self.settings.save();
+        let save_result = Settings::update_and_save("autoRefreshEnabled", self.auto_refresh);
         let msg = if self.auto_refresh {
             format!(
                 "Auto-refresh ON ({}s)",
@@ -2024,7 +2100,7 @@ impl App {
         let new_ms = ms.saturating_add(10_000).min(300_000);
         self.auto_refresh_interval = Duration::from_millis(new_ms);
         self.settings.auto_refresh_ms = new_ms;
-        let save_result = self.settings.save();
+        let save_result = Settings::update_and_save("autoRefreshMs", new_ms);
         let msg = format!("Refresh interval: {}s", new_ms / 1000);
         if let Err(e) = save_result {
             self.set_status(&format!("{} (save failed: {})", msg, e));
@@ -2038,7 +2114,7 @@ impl App {
         let new_ms = ms.saturating_sub(10_000).max(30_000);
         self.auto_refresh_interval = Duration::from_millis(new_ms);
         self.settings.auto_refresh_ms = new_ms;
-        let save_result = self.settings.save();
+        let save_result = Settings::update_and_save("autoRefreshMs", new_ms);
         let msg = format!("Refresh interval: {}s", new_ms / 1000);
         if let Err(e) = save_result {
             self.set_status(&format!("{} (save failed: {})", msg, e));
@@ -2100,14 +2176,40 @@ impl App {
                 .get_sorted_monthly()
                 .get(self.selected_index)
                 .map(|m| format!("{}: {} tokens, ${:.4}", m.month, m.tokens.total(), m.cost)),
+            Tab::Sessions => self
+                .get_sorted_sessions()
+                .get(self.selected_index)
+                .map(|s| {
+                    let label = s
+                        .title
+                        .as_deref()
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or(&s.session_id);
+                    format!(
+                        "{} / {}: {} tokens, ${:.4}",
+                        s.client,
+                        label,
+                        s.tokens.total(),
+                        s.cost
+                    )
+                }),
             Tab::Stats | Tab::Usage => None,
+            Tab::Projects => self
+                .get_sorted_projects()
+                .get(self.selected_index)
+                .map(|p| format!("{}: {} tokens, ${:.4}", p.label, p.tokens.total(), p.cost)),
         };
 
         if let Some(text) = text {
+            #[cfg(not(target_os = "android"))]
             match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
                 Ok(_) => self.set_status("Copied to clipboard"),
                 Err(_) => self.set_status("Failed to copy"),
             }
+            #[cfg(target_os = "android")]
+            let _ = text; // arboard has no Android backend; the yank key is a no-op here.
+            #[cfg(target_os = "android")]
+            self.set_status("Clipboard not supported on Android");
         }
     }
 
@@ -2492,6 +2594,96 @@ impl App {
     pub fn is_very_narrow(&self) -> bool {
         self.terminal_width < 60
     }
+
+    pub fn get_sorted_sessions(&self) -> Vec<&SessionUsage> {
+        let mut sessions: Vec<&SessionUsage> = self.data.sessions.iter().collect();
+        sort_usage_rows(
+            &mut sessions,
+            self.sort_field,
+            self.sort_direction,
+            |a, b| {
+                a.client
+                    .cmp(&b.client)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            },
+        );
+        sessions
+    }
+
+    pub fn get_sorted_projects(&self) -> Vec<&ProjectUsage> {
+        let mut projects: Vec<&ProjectUsage> = self.data.projects.iter().collect();
+        sort_usage_rows(
+            &mut projects,
+            self.sort_field,
+            self.sort_direction,
+            |a, b| {
+                a.label
+                    .cmp(&b.label)
+                    .then_with(|| a.workspace_key.cmp(&b.workspace_key))
+                    .then_with(|| a.group_key.cmp(&b.group_key))
+            },
+        );
+        projects
+    }
+}
+
+/// The columns the Sessions and Projects tabs sort on. Both tabs order rows
+/// the same way -- the chosen metric, then most recent activity, then a
+/// tab-specific tie-breaker that names the row -- so the ordering lives in
+/// [`sort_usage_rows`] and each tab supplies only its tie-breaker.
+trait SortableUsage {
+    fn cost(&self) -> f64;
+    fn token_total(&self) -> u64;
+    fn last_active_ms(&self) -> i64;
+}
+
+impl SortableUsage for SessionUsage {
+    fn cost(&self) -> f64 {
+        self.cost
+    }
+    fn token_total(&self) -> u64 {
+        self.tokens.total()
+    }
+    fn last_active_ms(&self) -> i64 {
+        self.last_active_ms
+    }
+}
+
+impl SortableUsage for ProjectUsage {
+    fn cost(&self) -> f64 {
+        self.cost
+    }
+    fn token_total(&self) -> u64 {
+        self.tokens.total()
+    }
+    fn last_active_ms(&self) -> i64 {
+        self.last_active_ms
+    }
+}
+
+/// Sort `rows` by `field` in `direction`, then by most recent activity, then
+/// by `tie_breaker`. "Date" is last activity itself: most recently active
+/// first when descending, oldest first when ascending.
+fn sort_usage_rows<T: SortableUsage>(
+    rows: &mut [&T],
+    field: SortField,
+    direction: SortDirection,
+    tie_breaker: impl Fn(&T, &T) -> std::cmp::Ordering,
+) {
+    let metric = |a: &T, b: &T| match field {
+        SortField::Cost => a.cost().total_cmp(&b.cost()),
+        SortField::Tokens => a.token_total().cmp(&b.token_total()),
+        SortField::Date => a.last_active_ms().cmp(&b.last_active_ms()),
+    };
+    rows.sort_by(|a, b| {
+        let primary = match direction {
+            SortDirection::Descending => metric(b, a),
+            SortDirection::Ascending => metric(a, b),
+        };
+        primary
+            .then_with(|| b.last_active_ms().cmp(&a.last_active_ms()))
+            .then_with(|| tie_breaker(a, b))
+    })
 }
 
 #[cfg(test)]
@@ -2509,7 +2701,7 @@ mod tests {
     #[test]
     fn test_tab_all() {
         let tabs = Tab::all();
-        assert_eq!(tabs.len(), 9);
+        assert_eq!(tabs.len(), 11);
         assert_eq!(tabs[0], Tab::Overview);
         assert_eq!(tabs[1], Tab::Usage);
         assert_eq!(tabs[2], Tab::Models);
@@ -2517,8 +2709,10 @@ mod tests {
         assert_eq!(tabs[4], Tab::Hourly);
         assert_eq!(tabs[5], Tab::Minutely);
         assert_eq!(tabs[6], Tab::Monthly);
-        assert_eq!(tabs[7], Tab::Stats);
-        assert_eq!(tabs[8], Tab::Agents);
+        assert_eq!(tabs[7], Tab::Sessions);
+        assert_eq!(tabs[8], Tab::Projects);
+        assert_eq!(tabs[9], Tab::Stats);
+        assert_eq!(tabs[10], Tab::Agents);
     }
 
     #[test]
@@ -2529,7 +2723,9 @@ mod tests {
         assert_eq!(Tab::Daily.next(), Tab::Hourly);
         assert_eq!(Tab::Hourly.next(), Tab::Minutely);
         assert_eq!(Tab::Minutely.next(), Tab::Monthly);
-        assert_eq!(Tab::Monthly.next(), Tab::Stats);
+        assert_eq!(Tab::Monthly.next(), Tab::Sessions);
+        assert_eq!(Tab::Sessions.next(), Tab::Projects);
+        assert_eq!(Tab::Projects.next(), Tab::Stats);
         assert_eq!(Tab::Stats.next(), Tab::Agents);
         assert_eq!(Tab::Agents.next(), Tab::Overview);
     }
@@ -2543,7 +2739,9 @@ mod tests {
         assert_eq!(Tab::Hourly.prev(), Tab::Daily);
         assert_eq!(Tab::Minutely.prev(), Tab::Hourly);
         assert_eq!(Tab::Monthly.prev(), Tab::Minutely);
-        assert_eq!(Tab::Stats.prev(), Tab::Monthly);
+        assert_eq!(Tab::Sessions.prev(), Tab::Monthly);
+        assert_eq!(Tab::Projects.prev(), Tab::Sessions);
+        assert_eq!(Tab::Stats.prev(), Tab::Projects);
         assert_eq!(Tab::Agents.prev(), Tab::Stats);
     }
 
@@ -2556,6 +2754,8 @@ mod tests {
         assert_eq!(Tab::Hourly.as_str(), "Hourly");
         assert_eq!(Tab::Minutely.as_str(), "Minutely");
         assert_eq!(Tab::Monthly.as_str(), "Monthly");
+        assert_eq!(Tab::Sessions.as_str(), "Sessions");
+        assert_eq!(Tab::Projects.as_str(), "Projects");
         assert_eq!(Tab::Stats.as_str(), "Stats");
     }
 
@@ -2568,7 +2768,38 @@ mod tests {
         assert_eq!(Tab::Hourly.short_name(), "Hr");
         assert_eq!(Tab::Minutely.short_name(), "Min");
         assert_eq!(Tab::Monthly.short_name(), "Mon");
+        assert_eq!(Tab::Sessions.short_name(), "Ses");
+        assert_eq!(Tab::Projects.short_name(), "Prj");
         assert_eq!(Tab::Stats.short_name(), "Sta");
+    }
+
+    /// `--merge-worktrees` has to survive into an interactive launch.
+    ///
+    /// The rollup used to be hardcoded to the default here, so the flag parsed
+    /// fine, changed `--light`/`--json` output, and was then silently dropped when
+    /// the same command opened the TUI — the user saw unmerged rows with no
+    /// indication their flag had been ignored.
+    #[test]
+    fn tui_config_seeds_the_initial_worktree_rollup() {
+        let merged = App::new_with_cached_data(
+            TuiConfig {
+                worktree_rollup: tokscale_core::WorktreeRollup::MergeIntoRepo,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            merged.worktree_rollup,
+            tokscale_core::WorktreeRollup::MergeIntoRepo
+        );
+
+        // And the default stays per-worktree when the flag is absent.
+        let plain = App::new_with_cached_data(TuiConfig::default(), None).unwrap();
+        assert_eq!(
+            plain.worktree_rollup,
+            tokscale_core::WorktreeRollup::Separate
+        );
     }
 
     #[test]
@@ -2582,6 +2813,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: None,
+            ..Default::default()
         };
         let mut app = App::new_with_cached_data(config, None).unwrap();
 
@@ -2607,6 +2839,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: None,
+            ..Default::default()
         };
         let mut app = App::new_with_cached_data(config, None).unwrap();
 
@@ -2614,6 +2847,7 @@ mod tests {
         app.data.models = vec![
             ModelUsage {
                 model: "model1".to_string(),
+                color_key: "model1".to_string(),
                 provider: "provider1".to_string(),
                 client: "opencode".to_string(),
                 tokens: TokenBreakdown::default(),
@@ -2625,6 +2859,7 @@ mod tests {
             },
             ModelUsage {
                 model: "model2".to_string(),
+                color_key: "model2".to_string(),
                 provider: "provider2".to_string(),
                 client: "opencode".to_string(),
                 tokens: TokenBreakdown::default(),
@@ -2656,6 +2891,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: None,
+            ..Default::default()
         };
         let mut app = App::new_with_cached_data(config, None).unwrap();
 
@@ -2663,6 +2899,7 @@ mod tests {
         app.data.models = vec![
             ModelUsage {
                 model: "model1".to_string(),
+                color_key: "model1".to_string(),
                 provider: "provider1".to_string(),
                 client: "opencode".to_string(),
                 tokens: TokenBreakdown::default(),
@@ -2674,6 +2911,7 @@ mod tests {
             },
             ModelUsage {
                 model: "model2".to_string(),
+                color_key: "model2".to_string(),
                 provider: "provider2".to_string(),
                 client: "opencode".to_string(),
                 tokens: TokenBreakdown::default(),
@@ -2705,12 +2943,14 @@ mod tests {
             until: None,
             year: None,
             initial_tab: None,
+            ..Default::default()
         };
         let mut app = App::new_with_cached_data(config, None).unwrap();
 
         // Add some mock data
         app.data.models = vec![ModelUsage {
             model: "model1".to_string(),
+            color_key: "model1".to_string(),
             provider: "provider1".to_string(),
             client: "opencode".to_string(),
             tokens: TokenBreakdown::default(),
@@ -2745,6 +2985,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: None,
+            ..Default::default()
         };
         let mut app = App::new_with_cached_data(config, None).unwrap();
 
@@ -2779,6 +3020,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: None,
+            ..Default::default()
         };
         let app = App::new_with_cached_data(config, None).unwrap();
 
@@ -2808,6 +3050,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: None,
+            ..Default::default()
         };
         let app = App::new_with_cached_data(config, None).unwrap();
 
@@ -2843,6 +3086,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: None,
+            ..Default::default()
         };
         let app = App::new_with_cached_data(config, None).unwrap();
 
@@ -2867,6 +3111,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: None,
+            ..Default::default()
         };
         App::new_with_cached_data(config, None).unwrap()
     }
@@ -2875,6 +3120,7 @@ mod tests {
         UsageOutput {
             provider: provider.to_string(),
             account,
+            credential_source: None,
             plan: Some("Pro".to_string()),
             email: None,
             metrics: vec![UsageMetric {
@@ -3012,6 +3258,7 @@ mod tests {
         app.data.models = (0..n)
             .map(|i| ModelUsage {
                 model: format!("model{}", i),
+                color_key: format!("model{}", i),
                 provider: "provider".to_string(),
                 client: "opencode".to_string(),
                 tokens: TokenBreakdown::default(),
@@ -3446,6 +3693,12 @@ mod tests {
         assert_eq!(app.current_tab, Tab::Monthly);
 
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Sessions);
+
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Projects);
+
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.current_tab, Tab::Stats);
 
         app.handle_key_event(key(KeyCode::Tab));
@@ -3465,6 +3718,12 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Stats);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Projects);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Sessions);
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Monthly);
@@ -3498,6 +3757,8 @@ mod tests {
             Tab::Hourly,
             Tab::Minutely,
             Tab::Monthly,
+            Tab::Sessions,
+            Tab::Projects,
             Tab::Stats,
             Tab::Agents,
             Tab::Overview,
@@ -3518,6 +3779,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: Some(Tab::Minutely),
+            ..Default::default()
         };
         let app = App::new_with_cached_data(config, Some(UsageData::default())).unwrap();
         assert_eq!(app.current_tab, Tab::Overview);
@@ -3854,6 +4116,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: Some(Tab::Hourly),
+            ..Default::default()
         };
 
         let app = App::new_with_cached_data(config, None).unwrap();
@@ -4025,6 +4288,195 @@ mod tests {
             app.handle_key_event(key(KeyCode::Char('p')));
         }
         assert_eq!(app.theme.name, initial_theme);
+    }
+
+    // Other app tests also save settings without taking the serial-test lock.
+    // Give these disk-backed tests their own process instead of changing the
+    // config directory underneath those tests.
+    fn settings_test_runs_in_child(test_name: &str) -> bool {
+        const MARKER: &str = "TOKSCALE_TUI_SETTINGS_TEST";
+        if env::var(MARKER).as_deref() == Ok(test_name) {
+            return true;
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("tui::app::tests::{test_name}"),
+                "--nocapture",
+            ])
+            .env(MARKER, test_name)
+            .env("TOKSCALE_CONFIG_DIR", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        false
+    }
+
+    #[test]
+    fn tui_settings_changes_preserve_external_edits() {
+        if !settings_test_runs_in_child("tui_settings_changes_preserve_external_edits") {
+            return;
+        }
+
+        let path = crate::paths::get_config_dir().join("settings.json");
+        let initial = Settings {
+            auto_refresh_enabled: true,
+            ..Settings::default()
+        };
+        let cases = [
+            (
+                key(KeyCode::Char('p')),
+                "colorPalette",
+                serde_json::json!(initial.theme_name().next().as_str()),
+            ),
+            (
+                key(KeyCode::Char('L')),
+                "tuiLightMode",
+                serde_json::json!(true),
+            ),
+            (
+                key_with_mod(KeyCode::Char('R'), KeyModifiers::SHIFT),
+                "autoRefreshEnabled",
+                serde_json::json!(false),
+            ),
+            (
+                key(KeyCode::Char('+')),
+                "autoRefreshMs",
+                serde_json::json!(70_000),
+            ),
+            (
+                key(KeyCode::Char('-')),
+                "autoRefreshMs",
+                serde_json::json!(50_000),
+            ),
+        ];
+
+        for (event, field, value) in cases {
+            fs::write(&path, serde_json::to_vec(&initial).unwrap()).unwrap();
+            let mut app = make_app();
+            assert!(app.settings.usage.disabled_providers.is_empty());
+
+            let mut expected = serde_json::to_value(&initial).unwrap();
+            expected["usage"]["disabledProviders"] = serde_json::json!(["copilot"]);
+            expected["colorPalette"] = serde_json::json!("halloween");
+            expected["tuiLightMode"] = serde_json::json!(true);
+            expected["autoRefreshEnabled"] = serde_json::json!(false);
+            expected["autoRefreshMs"] = serde_json::json!(120_000);
+            expected["defaultClients"] = serde_json::json!(["claude"]);
+            expected["autosubmit"]["enabled"] = serde_json::json!(true);
+            expected["futurePreference"] = serde_json::json!({"enabled": true});
+            expected["usage"]["futureProviderOption"] = serde_json::json!(["keep", 7]);
+            expected["scanner"]["futureScanOption"] = serde_json::json!("keep");
+            expected["nativeTimeoutMs"] = serde_json::json!(1);
+            expected[field] = serde_json::to_value(&initial).unwrap()[field].clone();
+            fs::write(&path, serde_json::to_vec(&expected).unwrap()).unwrap();
+
+            app.handle_key_event(event);
+
+            expected[field] = value.clone();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved, expected, "unexpected settings after {event:?}");
+            assert_eq!(serde_json::to_value(&app.settings).unwrap()[field], value);
+            assert!(!app
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("save failed"));
+        }
+    }
+
+    #[test]
+    fn tui_settings_changes_preserve_unknown_number_precision() {
+        if !settings_test_runs_in_child("tui_settings_changes_preserve_unknown_number_precision") {
+            return;
+        }
+
+        let path = crate::paths::get_config_dir().join("settings.json");
+        let mut app = make_app();
+        for number in [
+            "18446744073709551617",
+            "0.12345678901234567890123456789",
+            "1e400",
+        ] {
+            let nested = format!(r#"{{ "values" : [ {number} ] }}"#);
+            fs::write(
+                &path,
+                format!(r#"{{"futureNumber":{number},"futureObject":{nested}}}"#),
+            )
+            .unwrap();
+            app.handle_key_event(key(KeyCode::Char('p')));
+            let saved = fs::read_to_string(&path).unwrap();
+            assert!(saved.contains(number), "number changed in {saved}");
+            assert!(saved.contains(&nested), "nested JSON changed in {saved}");
+            assert!(saved.contains(app.theme.name.as_str()));
+            assert!(!app
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("save failed"));
+        }
+    }
+
+    #[test]
+    fn tui_settings_changes_preserve_sparse_external_edits() {
+        if !settings_test_runs_in_child("tui_settings_changes_preserve_sparse_external_edits") {
+            return;
+        }
+
+        let path = crate::paths::get_config_dir().join("settings.json");
+        let mut app = make_app();
+        app.handle_key_event(key(KeyCode::Char('L')));
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, serde_json::json!({"tuiLightMode": true}));
+
+        let mut external = serde_json::json!({
+            "futurePreference": {"enabled": true},
+            "usage": {"disabledProviders": ["copilot"], "futureProviderOption": "keep"}
+        });
+        fs::write(&path, serde_json::to_vec(&external).unwrap()).unwrap();
+        app.handle_key_event(key(KeyCode::Char('p')));
+        external["colorPalette"] = app.theme.name.as_str().into();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, external);
+    }
+
+    #[test]
+    fn tui_settings_changes_preserve_malformed_external_edits() {
+        if !settings_test_runs_in_child("tui_settings_changes_preserve_malformed_external_edits") {
+            return;
+        }
+
+        let path = crate::paths::get_config_dir().join("settings.json");
+        for malformed in [r#"{"usage":{"disabledProviders":{"copilot":true}}}"#, "[]"] {
+            for event in [key(KeyCode::Char('p')), key(KeyCode::Char('L'))] {
+                fs::write(&path, b"{}").unwrap();
+                let mut app = make_app();
+                fs::write(&path, malformed).unwrap();
+
+                app.handle_key_event(event);
+
+                assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+                assert!(app
+                    .status_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("save failed"));
+                if event.code == KeyCode::Char('p') {
+                    assert_eq!(app.theme.name, ThemeName::Blue.next());
+                } else {
+                    assert!(app.settings.tui_light_mode);
+                }
+            }
+        }
     }
 
     // ── handle_key_event: export ────────────────────────────────────
@@ -4764,6 +5216,7 @@ mod tests {
     fn model_usage(name: &str, cost: f64, workspace: Option<&str>) -> ModelUsage {
         ModelUsage {
             model: name.to_string(),
+            color_key: name.to_string(),
             provider: "anthropic".to_string(),
             client: "claude".to_string(),
             workspace_key: workspace.map(String::from),
@@ -4914,6 +5367,7 @@ mod tests {
         app.data.models = vec![
             ModelUsage {
                 model: "claude-opus-4-5".to_string(),
+                color_key: "claude-opus-4-5".to_string(),
                 provider: "anthropic".to_string(),
                 client: "claude".to_string(),
                 workspace_key: None,
@@ -4925,6 +5379,7 @@ mod tests {
             },
             ModelUsage {
                 model: "gpt-5".to_string(),
+                color_key: "gpt-5".to_string(),
                 provider: "openai".to_string(),
                 client: "codex".to_string(),
                 workspace_key: None,
@@ -4981,6 +5436,7 @@ mod tests {
         app.data.models = vec![
             ModelUsage {
                 model: "sonnet-shared".to_string(),
+                color_key: "sonnet-shared".to_string(),
                 provider: "anthropic".to_string(),
                 client: "claude".to_string(),
                 workspace_key: None,
@@ -4992,6 +5448,7 @@ mod tests {
             },
             ModelUsage {
                 model: "sonnet-shared".to_string(),
+                color_key: "sonnet-shared".to_string(),
                 provider: "openai".to_string(),
                 client: "codex".to_string(),
                 workspace_key: None,
@@ -5027,6 +5484,7 @@ mod tests {
         let mut app = make_app();
         let copilot_fable = ModelUsage {
             model: "claude-fable-5".to_string(),
+            color_key: "claude-fable-5".to_string(),
             provider: "github-copilot".to_string(),
             client: "opencode".to_string(),
             workspace_key: None,
@@ -5038,6 +5496,8 @@ mod tests {
         };
         app.data.models = vec![
             ModelUsage {
+                model: "claude-fable-5".to_string(),
+                color_key: "claude-fable-5".to_string(),
                 provider: "anthropic".to_string(),
                 cost: 5.0,
                 ..copilot_fable.clone()

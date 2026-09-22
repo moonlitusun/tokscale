@@ -6,6 +6,8 @@ import {
 import type { UserEmbedStats } from "../../src/lib/embed/getUserEmbedStats";
 
 const mockStats: UserEmbedStats = {
+  period: "all",
+  dateRange: null,
   user: {
     id: "user-id",
     username: "octocat",
@@ -18,6 +20,7 @@ const mockStats: UserEmbedStats = {
     submissionCount: 7,
     rank: 3,
     updatedAt: "2026-02-24T00:00:00.000Z",
+    hasBackfill: false,
   },
 };
 

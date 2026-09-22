@@ -182,7 +182,7 @@ async fn load_wrapped_data(options: &WrappedOptions) -> Result<WrappedData> {
     let mut cursor_sync_result: Option<cursor::SyncCursorResult> = None;
 
     if include_cursor && cursor_logged_in {
-        cursor_sync_result = Some(cursor::sync_cursor_cache().await);
+        cursor_sync_result = Some(cursor::sync_cursor_cache(false).await);
     }
 
     if let Some(sync) = cursor_sync_result.as_ref() {
@@ -248,6 +248,7 @@ async fn load_wrapped_data(options: &WrappedOptions) -> Result<WrappedData> {
         until: Some(until),
         year: Some(year.clone()),
         group_by: GroupBy::default(),
+        worktree_rollup: tokscale_core::WorktreeRollup::default(),
         scanner_settings: crate::tui::settings::load_scanner_settings(),
     })
     .await
@@ -422,7 +423,7 @@ fn build_top_agents(parsed: &tokscale_core::ParsedMessages) -> Vec<WrappedAgentE
 }
 
 async fn generate_wrapped_image(data: &WrappedData, options: &RenderOptions) -> Result<RgbaImage> {
-    let client = reqwest::Client::new();
+    let client = tokscale_core::http::client();
     let fonts = ensure_fonts_loaded(&client).await?;
 
     let mut canvas =
@@ -1441,81 +1442,19 @@ fn format_number_with_commas_i64(value: i64) -> String {
 }
 
 fn client_display_name(client: &str) -> Option<&'static str> {
-    match client {
-        "opencode" => Some("OpenCode"),
-        "claude" => Some("Claude Code"),
-        "codex" => Some("Codex CLI"),
-        "copilot" => Some("Copilot CLI"),
-        "gemini" => Some("Gemini CLI"),
-        s if s == ClientId::Cursor.as_str() => Some("Cursor IDE"),
-        "amp" => Some("Amp"),
-        "codebuff" => Some("Codebuff"),
-        "droid" => Some("Droid"),
-        "openclaw" => Some("OpenClaw"),
-        "hermes" => Some("Hermes Agent"),
-        "pi" => Some("Pi"),
-        "kimi" => Some("Kimi CLI"),
-        "qwen" => Some("Qwen CLI"),
-        "roocode" => Some("Roo Code"),
-        "kilocode" => Some("Kilo"),
-        "kilo" => Some("Kilo CLI"),
-        "mux" => Some("Mux"),
-        "crush" => Some("Crush"),
-        "goose" => Some("Goose"),
-        "antigravity" => Some("Antigravity"),
-        "antigravity-cli" => Some("Antigravity CLI"),
-        "zed" => Some("Zed Agent"),
-        "warp" => Some("Warp"),
-        "cline" => Some("Cline"),
-        "gjc" => Some("Gajae-Code"),
-        "jcode" => Some("Jcode"),
-        "junie" => Some("Junie"),
-        "synthetic" => Some("Synthetic"),
-        _ => None,
-    }
+    ClientId::from_str(client)
+        .map(|client| client.display_name())
+        .or_else(|| (client == "9router").then_some("9Router"))
+        .or_else(|| (client == "synthetic").then_some("Synthetic"))
 }
 
 fn client_logo_url(client_name: &str) -> Option<&'static str> {
-    match client_name {
-        "OpenCode" => Some("https://tokscale.ai/assets/logos/opencode.png"),
-        "Claude Code" => Some("https://tokscale.ai/assets/logos/claude.jpg"),
-        "Codex CLI" => Some("https://tokscale.ai/assets/logos/openai.jpg"),
-        "Copilot CLI" => Some(
-            "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-copilot.jpg",
-        ),
-        "Gemini CLI" => Some("https://tokscale.ai/assets/logos/gemini.png"),
-        "Cursor IDE" => Some("https://tokscale.ai/assets/logos/cursor.jpg"),
-        "Amp" => Some("https://tokscale.ai/assets/logos/amp.png"),
-        "Codebuff" => Some(
-            "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-codebuff.png",
-        ),
-        "Droid" => Some("https://tokscale.ai/assets/logos/droid.png"),
-        "OpenClaw" => Some("https://tokscale.ai/assets/logos/openclaw.png"),
-        "Hermes Agent" => Some("https://tokscale.ai/assets/logos/hermes.png"),
-        "Pi" => Some("https://tokscale.ai/assets/logos/pi.png"),
-        "Kimi CLI" => Some("https://tokscale.ai/assets/logos/kimi.png"),
-        "Qwen CLI" => Some("https://tokscale.ai/assets/logos/qwen.png"),
-        "Roo Code" => Some("https://tokscale.ai/assets/logos/roocode.png"),
-        "Kilo" => Some("https://tokscale.ai/assets/logos/kilocode.png"),
-        "Kilo CLI" => Some("https://tokscale.ai/assets/logos/kilocode.png"),
-        "Mux" => Some("https://tokscale.ai/assets/logos/mux.png"),
-        "Crush" => Some(
-            "https://raw.githubusercontent.com/junhoyeo/tokscale/6b483d0f2de3717266dec8faed13acd067f90ff3/.github/assets/client-crush.png",
-        ),
-        "Goose" => Some(
-            "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-goose.png",
-        ),
-        "Antigravity" | "Antigravity CLI" => Some(
-            "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-antigravity.png",
-        ),
-        "Zed Agent" => Some(
-            "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-zed.webp",
-        ),
-        "Jcode" => Some("https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-jcode.png"),
-        "Junie" => Some("https://github.com/JetBrains.png"),
-        "Synthetic" => Some("https://tokscale.ai/assets/logos/synthetic.png"),
-        _ => None,
-    }
+    ClientId::iter()
+        .find(|client| client.display_name() == client_name)
+        .and_then(|client| client.logo_url())
+        .or_else(|| {
+            (client_name == "Synthetic").then_some("https://tokscale.ai/assets/logos/synthetic.png")
+        })
 }
 
 fn provider_logo_url(provider: &str) -> Option<&'static str> {
@@ -2440,6 +2379,11 @@ mod tests {
     }
 
     #[test]
+    fn test_client_display_name_prime_agent() {
+        assert_eq!(client_display_name("prime-agent"), Some("Prime Agent"));
+    }
+
+    #[test]
     fn test_client_display_name_kilo() {
         assert_eq!(client_display_name("kilo"), Some("Kilo CLI"));
     }
@@ -2472,6 +2416,26 @@ mod tests {
     #[test]
     fn test_client_display_name_junie() {
         assert_eq!(client_display_name("junie"), Some("Junie"));
+    }
+
+    #[test]
+    fn test_client_display_name_muse() {
+        assert_eq!(client_display_name("muse"), Some("Muse Code"));
+    }
+
+    #[test]
+    fn test_client_display_name_covers_every_registered_client() {
+        for client in ClientId::iter() {
+            assert_eq!(
+                client_display_name(client.as_str()),
+                Some(client.display_name())
+            );
+        }
+    }
+
+    #[test]
+    fn test_client_display_name_9router_alias() {
+        assert_eq!(client_display_name("9router"), Some("9Router"));
     }
 
     #[test]
@@ -2571,7 +2535,7 @@ mod tests {
     fn test_client_logo_url_openclaw() {
         assert_eq!(
             client_logo_url("OpenClaw"),
-            Some("https://tokscale.ai/assets/logos/openclaw.png")
+            Some("https://github.com/openclaw.png")
         );
     }
 
@@ -2594,10 +2558,28 @@ mod tests {
     }
 
     #[test]
+    fn test_client_logo_url_freebuff() {
+        assert_eq!(
+            client_logo_url("Freebuff"),
+            Some(
+                "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-freebuff.png"
+            )
+        );
+    }
+
+    #[test]
     fn test_client_logo_url_pi() {
         assert_eq!(
             client_logo_url("Pi"),
             Some("https://tokscale.ai/assets/logos/pi.png")
+        );
+    }
+
+    #[test]
+    fn test_client_logo_url_prime_agent() {
+        assert_eq!(
+            client_logo_url("Prime Agent"),
+            Some("https://github.com/PrimeIntellect-ai.png")
         );
     }
 
@@ -2663,6 +2645,13 @@ mod tests {
             client_logo_url("Junie"),
             Some("https://github.com/JetBrains.png")
         );
+    }
+
+    #[test]
+    fn test_client_logo_url_uses_registered_metadata() {
+        for client in ClientId::iter() {
+            assert_eq!(client_logo_url(client.display_name()), client.logo_url());
+        }
     }
 
     #[test]
@@ -3050,7 +3039,7 @@ fn cursor_setup_warning_for_wrapped(
     let action = if cursor_logged_in {
         "run `tokscale cursor sync --json`"
     } else {
-        "run `tokscale cursor login` and `tokscale cursor sync --json`"
+        "run `tokscale cursor login` (auto-detects Cursor desktop when signed in) and `tokscale cursor sync --json`"
     };
 
     Some(format!(

@@ -7,6 +7,11 @@ pub(crate) enum TerminalColorMode {
 }
 
 impl TerminalColorMode {
+    // Terminal 2.15 (build 464, shipped with macOS 26 Tahoe) is the first
+    // Terminal.app that renders 24-bit SGR reliably. Older builds garble RGB
+    // sequences into saturated color blocks (see #559 and #1060).
+    const APPLE_TERMINAL_TRUECOLOR_VERSION: u32 = 464;
+
     pub(crate) fn from_env<I, K, V>(env: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -14,8 +19,9 @@ impl TerminalColorMode {
         V: AsRef<str>,
     {
         let mut term = String::new();
-        let mut term_program = String::new();
         let mut colorterm = String::new();
+        let mut term_program = String::new();
+        let mut term_program_version = String::new();
         let mut no_color = false;
 
         for (key, value) in env {
@@ -23,15 +29,23 @@ impl TerminalColorMode {
             let value = value.as_ref();
             match key {
                 "TERM" => term = value.to_ascii_lowercase(),
-                "TERM_PROGRAM" => term_program = value.to_ascii_lowercase(),
                 "COLORTERM" => colorterm = value.to_ascii_lowercase(),
+                "TERM_PROGRAM" => term_program = value.to_ascii_lowercase(),
+                "TERM_PROGRAM_VERSION" => term_program_version = value.to_string(),
                 "NO_COLOR" => no_color = true,
                 _ => {}
             }
         }
 
-        if no_color || term == "dumb" || term_program == "apple_terminal" {
+        if no_color || term == "dumb" {
             return Self::Compatible;
+        }
+
+        if term_program == "tmux"
+            && (matches!(colorterm.as_str(), "truecolor" | "24bit")
+                || term.contains("tmux-256color"))
+        {
+            return Self::FullColor;
         }
 
         if matches!(colorterm.as_str(), "truecolor" | "24bit")
@@ -41,7 +55,22 @@ impl TerminalColorMode {
             return Self::FullColor;
         }
 
-        Self::FullColor
+        // Terminal.app never sets COLORTERM, and only modern builds (macOS 26+)
+        // render 24-bit SGR. Gate on the version so old builds fall back to the
+        // named-color palette instead of garbling every theme into blocks.
+        if term_program == "apple_terminal" {
+            let version = term_program_version
+                .split('.')
+                .next()
+                .and_then(|v| v.parse::<u32>().ok());
+            if version.is_some_and(|v| v >= Self::APPLE_TERMINAL_TRUECOLOR_VERSION) {
+                return Self::FullColor;
+            }
+        }
+
+        // No positive evidence of truecolor support: prefer the named-color
+        // palette over raw RGB, which non-truecolor terminals garble.
+        Self::Compatible
     }
 }
 
@@ -59,6 +88,12 @@ pub enum ThemeName {
     Graphite,
     Lagoon,
     Dusk,
+    TokyoNight,
+    Catppuccin,
+    Solarized,
+    Gruvbox,
+    GruvboxMaterial,
+    OneDark,
 }
 
 impl ThemeName {
@@ -76,6 +111,12 @@ impl ThemeName {
             ThemeName::Graphite,
             ThemeName::Lagoon,
             ThemeName::Dusk,
+            ThemeName::TokyoNight,
+            ThemeName::Catppuccin,
+            ThemeName::Solarized,
+            ThemeName::Gruvbox,
+            ThemeName::GruvboxMaterial,
+            ThemeName::OneDark,
         ]
     }
 
@@ -99,6 +140,12 @@ impl ThemeName {
             ThemeName::Graphite => "graphite",
             ThemeName::Lagoon => "lagoon",
             ThemeName::Dusk => "dusk",
+            ThemeName::TokyoNight => "tokyo-night",
+            ThemeName::Catppuccin => "catppuccin",
+            ThemeName::Solarized => "solarized",
+            ThemeName::Gruvbox => "gruvbox",
+            ThemeName::GruvboxMaterial => "gruvbox-material",
+            ThemeName::OneDark => "one-dark",
         }
     }
 }
@@ -120,6 +167,12 @@ impl std::str::FromStr for ThemeName {
             "graphite" => Ok(ThemeName::Graphite),
             "lagoon" => Ok(ThemeName::Lagoon),
             "dusk" => Ok(ThemeName::Dusk),
+            "tokyo-night" => Ok(ThemeName::TokyoNight),
+            "catppuccin" => Ok(ThemeName::Catppuccin),
+            "solarized" => Ok(ThemeName::Solarized),
+            "gruvbox" => Ok(ThemeName::Gruvbox),
+            "gruvbox-material" => Ok(ThemeName::GruvboxMaterial),
+            "one-dark" => Ok(ThemeName::OneDark),
             _ => Err(()),
         }
     }
@@ -138,6 +191,7 @@ pub struct Theme {
     pub selection: Color,
     striped_row: Color,
     current_row: Color,
+    light: bool,
     color_mode: TerminalColorMode,
 }
 
@@ -236,6 +290,48 @@ impl Theme {
                 Color::Rgb(139, 92, 246),  // grade3: #8b5cf6
                 Color::Rgb(109, 40, 217),  // grade4: #6d28d9
             ],
+            ThemeName::TokyoNight => [
+                Color::Rgb(36, 40, 59),    // grade0: empty
+                Color::Rgb(125, 207, 255), // grade1: #7dcfff
+                Color::Rgb(122, 162, 247), // grade2: #7aa2f7
+                Color::Rgb(187, 154, 247), // grade3: #bb9af7
+                Color::Rgb(247, 118, 142), // grade4: #f7768e
+            ],
+            ThemeName::Catppuccin => [
+                Color::Rgb(49, 50, 68),    // grade0: empty
+                Color::Rgb(166, 227, 161), // grade1: #a6e3a1
+                Color::Rgb(137, 180, 250), // grade2: #89b4fa
+                Color::Rgb(203, 166, 247), // grade3: #cba6f7
+                Color::Rgb(243, 139, 168), // grade4: #f38ba8
+            ],
+            ThemeName::Solarized => [
+                Color::Rgb(7, 54, 66),    // grade0: empty
+                Color::Rgb(42, 161, 152), // grade1: #2aa198
+                Color::Rgb(38, 139, 210), // grade2: #268bd2
+                Color::Rgb(181, 137, 0),  // grade3: #b58900
+                Color::Rgb(220, 50, 47),  // grade4: #dc322f
+            ],
+            ThemeName::Gruvbox => [
+                Color::Rgb(50, 48, 47),    // grade0: empty
+                Color::Rgb(142, 192, 124), // grade1: #8ec07c
+                Color::Rgb(131, 165, 152), // grade2: #83a598
+                Color::Rgb(250, 189, 47),  // grade3: #fabd2f
+                Color::Rgb(251, 73, 52),   // grade4: #fb4934
+            ],
+            ThemeName::GruvboxMaterial => [
+                Color::Rgb(40, 40, 40),   // grade0: empty
+                Color::Rgb(184, 187, 38), // grade1: #b8bb26
+                Color::Rgb(250, 189, 47), // grade2: #fabd2f
+                Color::Rgb(215, 153, 33), // grade3: #d79921
+                Color::Rgb(251, 73, 52),  // grade4: #fb4934
+            ],
+            ThemeName::OneDark => [
+                Color::Rgb(40, 44, 52),    // grade0: empty
+                Color::Rgb(152, 195, 121), // grade1: #98c379
+                Color::Rgb(97, 175, 239),  // grade2: #61afef
+                Color::Rgb(198, 120, 221), // grade3: #c678dd
+                Color::Rgb(224, 108, 117), // grade4: #e06c75
+            ],
         };
 
         let mut theme = Self {
@@ -251,6 +347,7 @@ impl Theme {
             striped_row: Color::Rgb(20, 24, 30),
             current_row: Color::Rgb(28, 42, 34),
             color_mode,
+            light: false,
         };
 
         match name {
@@ -283,6 +380,66 @@ impl Theme {
                 theme.selection = Color::Rgb(43, 37, 58);
                 theme.striped_row = Color::Rgb(22, 20, 32);
                 theme.current_row = Color::Rgb(40, 45, 36);
+            }
+            ThemeName::TokyoNight => {
+                theme.background = Color::Rgb(26, 27, 38); // #1a1b26
+                theme.foreground = Color::Rgb(192, 202, 245); // #c0caf5
+                theme.border = Color::Rgb(65, 72, 104); // #414868
+                theme.muted = Color::Rgb(86, 95, 137); // #565f89
+                theme.accent = Color::Rgb(187, 154, 247); // #bb9af7
+                theme.selection = Color::Rgb(41, 46, 66); // #292e42
+                theme.striped_row = Color::Rgb(31, 35, 53);
+                theme.current_row = Color::Rgb(45, 74, 102);
+            }
+            ThemeName::Catppuccin => {
+                theme.background = Color::Rgb(30, 30, 46); // #1e1e2e
+                theme.foreground = Color::Rgb(205, 214, 244); // #cdd6f4
+                theme.border = Color::Rgb(88, 91, 112); // #585b70
+                theme.muted = Color::Rgb(166, 173, 200); // #a6adc8
+                theme.accent = Color::Rgb(203, 166, 247); // #cba6f7
+                theme.selection = Color::Rgb(69, 71, 90); // #45475a
+                theme.striped_row = Color::Rgb(49, 50, 68);
+                theme.current_row = Color::Rgb(69, 71, 90);
+            }
+            ThemeName::Solarized => {
+                theme.background = Color::Rgb(0, 43, 54); // #002b36
+                theme.foreground = Color::Rgb(147, 161, 161); // #93a1a1
+                theme.border = Color::Rgb(88, 110, 117); // #586e75
+                theme.muted = Color::Rgb(101, 123, 131); // #657b83
+                theme.accent = Color::Rgb(181, 137, 0); // #b58900
+                theme.selection = Color::Rgb(7, 54, 66); // #073642
+                theme.striped_row = Color::Rgb(0, 52, 65);
+                theme.current_row = Color::Rgb(7, 54, 66);
+            }
+            ThemeName::Gruvbox => {
+                theme.background = Color::Rgb(40, 40, 40); // #282828
+                theme.foreground = Color::Rgb(235, 219, 178); // #ebdbb2
+                theme.border = Color::Rgb(102, 92, 84); // #665c54
+                theme.muted = Color::Rgb(168, 153, 132); // #a89984
+                theme.accent = Color::Rgb(250, 189, 47); // #fabd2f
+                theme.selection = Color::Rgb(60, 56, 54); // #3c3836
+                theme.striped_row = Color::Rgb(50, 48, 47);
+                theme.current_row = Color::Rgb(69, 133, 136);
+            }
+            ThemeName::GruvboxMaterial => {
+                theme.background = Color::Rgb(50, 48, 47); // #32302f
+                theme.foreground = Color::Rgb(235, 219, 178); // #ebdbb2
+                theme.border = Color::Rgb(102, 92, 84); // #665c54
+                theme.muted = Color::Rgb(168, 153, 132); // #a89984
+                theme.accent = Color::Rgb(215, 153, 33); // #d79921
+                theme.selection = Color::Rgb(80, 73, 69); // #504945
+                theme.striped_row = Color::Rgb(60, 56, 54);
+                theme.current_row = Color::Rgb(69, 133, 136);
+            }
+            ThemeName::OneDark => {
+                theme.background = Color::Rgb(40, 44, 52); // #282c34
+                theme.foreground = Color::Rgb(171, 178, 191); // #abb2bf
+                theme.border = Color::Rgb(92, 99, 112); // #5c6370
+                theme.muted = Color::Rgb(130, 137, 151); // #828997
+                theme.accent = Color::Rgb(97, 175, 239); // #61afef
+                theme.selection = Color::Rgb(62, 68, 81); // #3e4451
+                theme.striped_row = Color::Rgb(44, 49, 58);
+                theme.current_row = Color::Rgb(58, 73, 94);
             }
             _ => {}
         }
@@ -317,19 +474,39 @@ impl Theme {
     }
 
     pub(crate) fn metric_input_style(&self) -> Style {
-        Style::default().fg(self.color(Color::Rgb(100, 200, 100)))
+        let c = if self.light {
+            Color::Rgb(31, 136, 61)
+        } else {
+            Color::Rgb(100, 200, 100)
+        };
+        Style::default().fg(self.color(c))
     }
 
     pub(crate) fn metric_output_style(&self) -> Style {
-        Style::default().fg(self.color(Color::Rgb(200, 100, 100)))
+        let c = if self.light {
+            Color::Rgb(207, 34, 46)
+        } else {
+            Color::Rgb(200, 100, 100)
+        };
+        Style::default().fg(self.color(c))
     }
 
     pub(crate) fn metric_cache_read_style(&self) -> Style {
-        Style::default().fg(self.color(Color::Rgb(100, 150, 200)))
+        let c = if self.light {
+            Color::Rgb(9, 105, 218)
+        } else {
+            Color::Rgb(100, 150, 200)
+        };
+        Style::default().fg(self.color(c))
     }
 
     pub(crate) fn metric_cache_write_style(&self) -> Style {
-        Style::default().fg(self.color(Color::Rgb(200, 150, 100)))
+        let c = if self.light {
+            Color::Rgb(170, 100, 20)
+        } else {
+            Color::Rgb(200, 150, 100)
+        };
+        Style::default().fg(self.color(c))
     }
 
     pub(crate) fn metric_total_style(&self) -> Style {
@@ -339,11 +516,21 @@ impl Theme {
     }
 
     pub(crate) fn secondary_text_style(&self) -> Style {
-        Style::default().fg(self.color(Color::Rgb(170, 170, 170)))
+        let c = if self.light {
+            Color::Rgb(106, 115, 125)
+        } else {
+            Color::Rgb(170, 170, 170)
+        };
+        Style::default().fg(self.color(c))
     }
 
     pub(crate) fn subtle_text_style(&self) -> Style {
-        Style::default().fg(self.color(Color::Rgb(102, 102, 102)))
+        let c = if self.light {
+            Color::Rgb(140, 149, 159)
+        } else {
+            Color::Rgb(102, 102, 102)
+        };
+        Style::default().fg(self.color(c))
     }
 
     pub(crate) fn striped_row_style(&self) -> Style {
@@ -360,6 +547,118 @@ impl Theme {
         } else {
             Style::default().bg(self.current_row)
         }
+    }
+
+    pub(crate) fn hint_key_color(&self) -> Color {
+        let c = if self.light {
+            if self.color_mode == TerminalColorMode::Compatible {
+                Color::DarkGray
+            } else {
+                Color::Rgb(160, 100, 20)
+            }
+        } else {
+            Color::Yellow
+        };
+        self.color(c)
+    }
+
+    pub(crate) fn hint_key_style(&self) -> Style {
+        Style::default().fg(self.hint_key_color())
+    }
+
+    pub(crate) fn count_color(&self) -> Color {
+        let c = if self.light {
+            Color::Rgb(14, 116, 144)
+        } else {
+            Color::Cyan
+        };
+        self.color(c)
+    }
+
+    pub(crate) fn count_style(&self) -> Style {
+        Style::default().fg(self.count_color())
+    }
+
+    pub(crate) fn graph_cell_selected_style(&self, bg: Color) -> Style {
+        let fg = match bg {
+            Color::Black | Color::DarkGray | Color::Blue => Color::White,
+            Color::White | Color::Gray | Color::Cyan => {
+                if self.light {
+                    self.foreground
+                } else {
+                    Color::Black
+                }
+            }
+            Color::Rgb(r, g, b) => {
+                let luminance = 299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b);
+                if luminance > 128_000 {
+                    if self.light {
+                        self.foreground
+                    } else {
+                        Color::Black
+                    }
+                } else {
+                    Color::White
+                }
+            }
+            _ if self.light => self.foreground,
+            _ => Color::White,
+        };
+        Style::default().fg(fg).bg(bg)
+    }
+
+    /// Build a light-background variant of `name` for the current terminal.
+    pub(crate) fn from_name_for_current_terminal_light(name: ThemeName) -> Self {
+        Self::from_name_with_color_mode_light(name, TerminalColorMode::from_env(std::env::vars()))
+    }
+
+    /// Build a light-background variant of `name` for an explicit color mode.
+    pub(crate) fn from_name_with_color_mode_light(
+        name: ThemeName,
+        color_mode: TerminalColorMode,
+    ) -> Self {
+        let mut theme = Self::from_name_with_color_mode(name, color_mode);
+        theme.apply_light();
+        theme
+    }
+
+    /// Invert the dark surface to a light one (white background, dark text)
+    /// while keeping the palette's accent grade colors. Driven by the TUI's
+    /// `L` toggle so light-terminal users get a readable UI.
+    fn apply_light(&mut self) {
+        self.light = true;
+        // Non-truecolor terminals garble raw RGB sequences, so stick to the
+        // named-color palette there instead of the tuned light surface.
+        if self.color_mode == TerminalColorMode::Compatible {
+            self.background = Color::White;
+            self.foreground = Color::Black;
+            self.border = Color::Gray;
+            self.muted = Color::DarkGray;
+            self.selection = Color::Gray;
+            self.striped_row = Color::White;
+            self.current_row = Color::Gray;
+            self.colors = [
+                Color::Gray,
+                Color::Cyan,
+                Color::Blue,
+                Color::DarkGray,
+                Color::Black,
+            ];
+            self.highlight = Color::Blue;
+            self.accent = Color::Blue;
+            return;
+        }
+        self.background = Color::Rgb(255, 255, 255);
+        self.foreground = Color::Rgb(36, 41, 47);
+        self.border = Color::Rgb(208, 215, 222);
+        self.muted = Color::Rgb(106, 115, 125);
+        self.selection = Color::Rgb(234, 240, 246);
+        self.striped_row = Color::Rgb(246, 248, 250);
+        self.current_row = Color::Rgb(234, 240, 246);
+        // Empty contribution cell: light gray instead of near-black on white.
+        self.colors[0] = Color::Rgb(235, 238, 242);
+        // Accent: a saturated mid grade reads better than Cyan on white.
+        self.accent = self.colors[3];
     }
 }
 
@@ -414,11 +713,71 @@ mod tests {
     }
 
     #[test]
-    fn apple_terminal_uses_compatible_color_mode() {
+    fn apple_terminal_keeps_full_color_and_per_theme_palettes() {
+        let mode = TerminalColorMode::from_env(env(&[
+            ("TERM_PROGRAM", "Apple_Terminal"),
+            ("TERM_PROGRAM_VERSION", "487"),
+            ("TERM", "xterm-256color"),
+        ]));
+
+        assert_eq!(mode, TerminalColorMode::FullColor);
+
+        // The regression this guards: in `Compatible` mode every theme collapses
+        // onto one grey/cyan palette, so cycling themes changed the footer label
+        // and nothing else.
+        let green = Theme::from_name_with_color_mode(ThemeName::Green, mode);
+        let blue = Theme::from_name_with_color_mode(ThemeName::Blue, mode);
+        assert_ne!(green.colors, blue.colors);
+    }
+
+    #[test]
+    fn old_apple_terminal_falls_back_to_compatible_colors() {
+        let mode = TerminalColorMode::from_env(env(&[
+            ("TERM_PROGRAM", "Apple_Terminal"),
+            ("TERM_PROGRAM_VERSION", "455"),
+            ("TERM", "xterm-256color"),
+        ]));
+
+        assert_eq!(mode, TerminalColorMode::Compatible);
+    }
+
+    #[test]
+    fn apple_terminal_without_version_uses_compatible_colors() {
         let mode = TerminalColorMode::from_env(env(&[
             ("TERM_PROGRAM", "Apple_Terminal"),
             ("TERM", "xterm-256color"),
         ]));
+
+        assert_eq!(mode, TerminalColorMode::Compatible);
+    }
+
+    #[test]
+    fn xterm_256_without_truecolor_evidence_uses_compatible_colors() {
+        let mode = TerminalColorMode::from_env(env(&[("TERM", "xterm-256color")]));
+
+        assert_eq!(mode, TerminalColorMode::Compatible);
+    }
+
+    #[test]
+    fn tmux_program_with_tmux_256_term_keeps_full_color() {
+        let mode = TerminalColorMode::from_env(env(&[
+            ("TERM_PROGRAM", "tmux"),
+            ("TERM", "tmux-256color"),
+        ]));
+
+        assert_eq!(mode, TerminalColorMode::FullColor);
+    }
+
+    #[test]
+    fn tmux_256_without_term_program_uses_compatible_colors() {
+        let mode = TerminalColorMode::from_env(env(&[("TERM", "tmux-256color")]));
+
+        assert_eq!(mode, TerminalColorMode::Compatible);
+    }
+
+    #[test]
+    fn screen_without_truecolor_evidence_uses_compatible_colors() {
+        let mode = TerminalColorMode::from_env(env(&[("TERM", "screen-256color")]));
 
         assert_eq!(mode, TerminalColorMode::Compatible);
     }
@@ -450,6 +809,43 @@ mod tests {
     }
 
     #[test]
+    fn theme_pack_names_parse_from_settings_strings() {
+        assert_eq!("tokyo-night".parse(), Ok(ThemeName::TokyoNight));
+        assert_eq!("catppuccin".parse(), Ok(ThemeName::Catppuccin));
+        assert_eq!("solarized".parse(), Ok(ThemeName::Solarized));
+        assert_eq!("gruvbox".parse(), Ok(ThemeName::Gruvbox));
+        assert_eq!("gruvbox-material".parse(), Ok(ThemeName::GruvboxMaterial));
+        assert_eq!("one-dark".parse(), Ok(ThemeName::OneDark));
+    }
+
+    #[test]
+    fn theme_pack_themes_are_listed_for_cycling() {
+        let themes = ThemeName::all();
+
+        assert!(themes.contains(&ThemeName::TokyoNight));
+        assert!(themes.contains(&ThemeName::Catppuccin));
+        assert!(themes.contains(&ThemeName::Solarized));
+        assert!(themes.contains(&ThemeName::Gruvbox));
+        assert!(themes.contains(&ThemeName::GruvboxMaterial));
+        assert!(themes.contains(&ThemeName::OneDark));
+    }
+
+    #[test]
+    fn gruvbox_material_differs_from_gruvbox() {
+        let gruvbox =
+            Theme::from_name_with_color_mode(ThemeName::Gruvbox, TerminalColorMode::FullColor);
+        let material = Theme::from_name_with_color_mode(
+            ThemeName::GruvboxMaterial,
+            TerminalColorMode::FullColor,
+        );
+
+        assert_ne!(gruvbox.background, material.background);
+        assert_ne!(gruvbox.accent, material.accent);
+        assert_ne!(gruvbox.selection, material.selection);
+        assert_ne!(gruvbox.colors, material.colors);
+    }
+
+    #[test]
     fn surface_themes_customize_background_and_row_colors() {
         let cases = [
             (
@@ -476,6 +872,54 @@ mod tests {
                 Color::Rgb(22, 20, 32),
                 Color::Rgb(40, 45, 36),
             ),
+            (
+                ThemeName::TokyoNight,
+                Color::Rgb(26, 27, 38),
+                Color::Rgb(192, 202, 245),
+                Color::Rgb(41, 46, 66),
+                Color::Rgb(31, 35, 53),
+                Color::Rgb(45, 74, 102),
+            ),
+            (
+                ThemeName::Catppuccin,
+                Color::Rgb(30, 30, 46),
+                Color::Rgb(205, 214, 244),
+                Color::Rgb(69, 71, 90),
+                Color::Rgb(49, 50, 68),
+                Color::Rgb(69, 71, 90),
+            ),
+            (
+                ThemeName::Solarized,
+                Color::Rgb(0, 43, 54),
+                Color::Rgb(147, 161, 161),
+                Color::Rgb(7, 54, 66),
+                Color::Rgb(0, 52, 65),
+                Color::Rgb(7, 54, 66),
+            ),
+            (
+                ThemeName::Gruvbox,
+                Color::Rgb(40, 40, 40),
+                Color::Rgb(235, 219, 178),
+                Color::Rgb(60, 56, 54),
+                Color::Rgb(50, 48, 47),
+                Color::Rgb(69, 133, 136),
+            ),
+            (
+                ThemeName::GruvboxMaterial,
+                Color::Rgb(50, 48, 47),
+                Color::Rgb(235, 219, 178),
+                Color::Rgb(80, 73, 69),
+                Color::Rgb(60, 56, 54),
+                Color::Rgb(69, 133, 136),
+            ),
+            (
+                ThemeName::OneDark,
+                Color::Rgb(40, 44, 52),
+                Color::Rgb(171, 178, 191),
+                Color::Rgb(62, 68, 81),
+                Color::Rgb(44, 49, 58),
+                Color::Rgb(58, 73, 94),
+            ),
         ];
 
         for (name, background, foreground, selection, striped, current) in cases {
@@ -487,6 +931,38 @@ mod tests {
             assert_eq!(theme.striped_row_style().bg, Some(striped));
             assert_eq!(theme.current_row_style().bg, Some(current));
         }
+    }
+    #[test]
+    fn light_variant_is_white_background_with_dark_text() {
+        let dark = Theme::from_name_with_color_mode(ThemeName::Blue, TerminalColorMode::FullColor);
+        let light =
+            Theme::from_name_with_color_mode_light(ThemeName::Blue, TerminalColorMode::FullColor);
+
+        assert!(!dark.light);
+        assert!(light.light);
+
+        // Light mode inverts the surface: white background, dark text.
+        assert_eq!(light.background, Color::Rgb(255, 255, 255));
+        assert_eq!(light.foreground, Color::Rgb(36, 41, 47));
+        assert_ne!(light.background, dark.background);
+
+        // Empty contribution cell becomes light gray, not near-black.
+        assert_eq!(light.colors[0], Color::Rgb(235, 238, 242));
+
+        // Metric text styles switch to dark-on-light contrast colors.
+        assert_eq!(
+            dark.metric_input_style().fg,
+            Some(Color::Rgb(100, 200, 100))
+        );
+        assert_eq!(light.metric_input_style().fg, Some(Color::Rgb(31, 136, 61)));
+        assert_eq!(
+            light.metric_output_style().fg,
+            Some(Color::Rgb(207, 34, 46))
+        );
+        assert_eq!(
+            light.metric_cache_read_style().fg,
+            Some(Color::Rgb(9, 105, 218))
+        );
     }
 
     #[test]
@@ -503,6 +979,102 @@ mod tests {
         assert_ne!(theme.background, Color::Reset);
         assert!(!matches!(theme.foreground, Color::Rgb(..)));
         assert!(!matches!(theme.selection, Color::Rgb(..)));
+    }
+
+    #[test]
+    fn compatible_light_theme_preserves_name_and_avoids_rgb_palette() {
+        let theme =
+            Theme::from_name_with_color_mode_light(ThemeName::Green, TerminalColorMode::Compatible);
+
+        assert_eq!(theme.name, ThemeName::Green);
+        assert!(theme.light);
+        assert!(theme
+            .colors
+            .iter()
+            .all(|color| !matches!(color, Color::Rgb(..))));
+        assert!(!matches!(theme.background, Color::Rgb(..)));
+        assert_ne!(theme.background, Color::Reset);
+        assert!(!matches!(theme.foreground, Color::Rgb(..)));
+        assert!(!matches!(theme.border, Color::Rgb(..)));
+        assert!(!matches!(theme.muted, Color::Rgb(..)));
+        assert!(!matches!(theme.selection, Color::Rgb(..)));
+        assert!(!matches!(theme.accent, Color::Rgb(..)));
+        assert!(!matches!(theme.striped_row, Color::Rgb(..)));
+        assert!(!matches!(theme.current_row, Color::Rgb(..)));
+
+        // The light surface still inverts: white background, dark text.
+        assert_eq!(theme.background, Color::White);
+        assert_eq!(theme.foreground, Color::Black);
+
+        // Every contribution grade color is distinct and never blends into the white background.
+        assert!(theme.colors.iter().all(|color| *color != Color::White));
+        let mut unique_colors = theme.colors.to_vec();
+        unique_colors.sort_by_key(|c| format!("{c:?}"));
+        unique_colors.dedup();
+        assert_eq!(unique_colors.len(), 5);
+    }
+
+    #[test]
+    fn theme_hint_and_count_styles_contrast_in_light_and_dark_modes() {
+        let dark = Theme::from_name_with_color_mode(ThemeName::Green, TerminalColorMode::FullColor);
+        let light =
+            Theme::from_name_with_color_mode_light(ThemeName::Green, TerminalColorMode::FullColor);
+
+        assert_eq!(dark.hint_key_style().fg, Some(Color::Yellow));
+        assert_eq!(dark.count_style().fg, Some(Color::Cyan));
+        assert_eq!(
+            dark.graph_cell_selected_style(Color::Black).fg,
+            Some(Color::White)
+        );
+        assert_eq!(
+            dark.graph_cell_selected_style(Color::White).fg,
+            Some(Color::Black)
+        );
+        assert_eq!(
+            dark.graph_cell_selected_style(Color::Rgb(250, 250, 250)).fg,
+            Some(Color::Black)
+        );
+        assert_eq!(
+            dark.graph_cell_selected_style(Color::Rgb(20, 20, 20)).fg,
+            Some(Color::White)
+        );
+
+        assert_eq!(light.hint_key_style().fg, Some(Color::Rgb(160, 100, 20)));
+        assert_eq!(light.count_style().fg, Some(Color::Rgb(14, 116, 144)));
+        assert_eq!(
+            light.graph_cell_selected_style(Color::White).fg,
+            Some(light.foreground)
+        );
+        assert_eq!(
+            light.graph_cell_selected_style(Color::Black).fg,
+            Some(Color::White)
+        );
+
+        let compat_dark =
+            Theme::from_name_with_color_mode(ThemeName::Green, TerminalColorMode::Compatible);
+        let compat_light =
+            Theme::from_name_with_color_mode_light(ThemeName::Green, TerminalColorMode::Compatible);
+
+        assert_eq!(compat_dark.hint_key_style().fg, Some(Color::Yellow));
+        assert_eq!(compat_dark.count_style().fg, Some(Color::Cyan));
+        assert_eq!(
+            compat_dark.graph_cell_selected_style(Color::White).fg,
+            Some(Color::Black)
+        );
+        assert_eq!(
+            compat_dark.graph_cell_selected_style(Color::Black).fg,
+            Some(Color::White)
+        );
+        assert_eq!(compat_light.hint_key_style().fg, Some(Color::DarkGray));
+        assert_eq!(compat_light.count_style().fg, Some(Color::Blue));
+        assert_eq!(
+            compat_light.graph_cell_selected_style(Color::White).fg,
+            Some(Color::Black)
+        );
+        assert_eq!(
+            compat_light.graph_cell_selected_style(Color::Black).fg,
+            Some(Color::White)
+        );
     }
 
     #[test]
@@ -531,6 +1103,8 @@ mod tests {
             theme.subtle_text_style(),
             theme.striped_row_style(),
             theme.current_row_style(),
+            theme.hint_key_style(),
+            theme.count_style(),
         ];
 
         for style in styles {

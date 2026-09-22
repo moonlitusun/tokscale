@@ -12,6 +12,7 @@
 
 use super::utils::{
     extract_i64, extract_string, file_modified_timestamp_ms, parse_timestamp_value,
+    session_id_from_path,
 };
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::provider_identity::inferred_provider_from_model;
@@ -20,6 +21,24 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
+
+/// Agents-tab bucket for a regular interactive Codex thread. Codex stamps each
+/// spawned thread with a random `agent_nickname` (a scientist/philosopher
+/// name), which is a per-session alias rather than a role, so the parser
+/// collapses them to a single name instead of letting every thread become its
+/// own Agents row.
+pub const CODEX_DEFAULT_AGENT: &str = "Codex";
+/// Agents-tab bucket for threads Codex started itself: any `source.subagent`
+/// variant, e.g. the `thread_spawn` workers of Ultra mode's orchestrated team.
+/// Guardian reviews have their own bucket.
+pub const CODEX_SUBAGENT_AGENT: &str = "Codex Subagent";
+/// Agents-tab bucket for guardian review threads. Codex tags the same
+/// `source.subagent.other: "guardian"` thread `thread_source: "guardian_review"`
+/// in newer builds (seen from 0.150) but `"subagent"` in older ones; both land
+/// here so the row does not split by Codex version.
+pub const CODEX_GUARDIAN_AGENT: &str = "Codex Guardian";
+/// Agents-tab bucket for `codex exec` headless runs.
+pub const CODEX_HEADLESS_AGENT: &str = "Codex Headless";
 
 /// Codex entry structure (from JSONL files)
 #[derive(Debug, Deserialize)]
@@ -34,6 +53,10 @@ pub struct CodexEntry {
 pub struct CodexPayload {
     pub id: Option<String>,
     pub forked_from_id: Option<String>,
+    /// `session_meta` only: the client that created the thread. Codex
+    /// app-server stamps it from the `initialize` request's `clientInfo.name`,
+    /// so a thread OpenClaw drove carries `"openclaw"` here.
+    pub originator: Option<String>,
     #[serde(rename = "type")]
     pub payload_type: Option<String>,
     pub model: Option<String>,
@@ -61,8 +84,6 @@ pub struct CodexPayload {
     pub cwd: Option<String>,
     /// Provider identity from session_meta (e.g. "openai", "azure")
     pub model_provider: Option<String>,
-    /// Agent name from session_meta
-    pub agent_nickname: Option<String>,
     /// Free-text body of an `event_msg` `user_message` payload. Used to detect
     /// human turn boundaries: real human input is plain text, whereas
     /// system-injected context (`<environment_context>`, `<system-reminder>`,
@@ -191,12 +212,26 @@ impl CodexTotals {
         // Clamp cached to not exceed input to prevent inflated totals when
         // malformed data reports more cached tokens than input tokens.
         let clamped_cached = self.cached.min(self.input).max(0);
+        // `reasoning_output_tokens` is a SUBSET of `output_tokens`, not a
+        // sibling of it: every Codex snapshot satisfies
+        // `total_tokens == input_tokens + output_tokens`, with the reasoning
+        // count never added on top. `TokenBreakdown` buckets are additive —
+        // `total()` sums output and reasoning, and `compute_cost` prices their
+        // sum at the output rate — so carrying the raw output through while
+        // also filling `reasoning` counted every reasoning token twice and
+        // billed it twice. Split it out instead, clamped so a malformed row
+        // claiming more reasoning than output cannot drive the bucket negative.
+        //
+        // This is a Codex-specific correction. Providers that genuinely report
+        // reasoning as a disjoint bucket (Gemini's `thoughtsTokenCount` beside
+        // `candidatesTokenCount`) must keep feeding it unmodified.
+        let clamped_reasoning = self.reasoning.max(0).min(self.output.max(0));
         TokenBreakdown {
             input: (self.input - clamped_cached).max(0),
-            output: self.output.max(0),
+            output: (self.output.max(0) - clamped_reasoning).max(0),
             cache_read: clamped_cached,
             cache_write: 0,
-            reasoning: self.reasoning.max(0),
+            reasoning: clamped_reasoning,
         }
     }
 }
@@ -210,6 +245,17 @@ pub(crate) struct CodexParseState {
     pub last_accepted_token_timestamp_ms: Option<i64>,
     pub previous_totals: Option<CodexTotals>,
     pub session_is_headless: bool,
+    /// Set when session_meta marks a thread Codex started itself (any
+    /// `source.subagent` variant, or `thread_source: "subagent"`), as opposed
+    /// to a human-initiated fork (`thread_source: "user"`). Guardian reviews
+    /// set `session_is_guardian` instead.
+    #[serde(default)]
+    pub session_is_subagent: bool,
+    /// Set when session_meta marks a guardian review thread. Never cleared, so
+    /// a later session_meta in the same rollout cannot move its usage back
+    /// into the interactive bucket.
+    #[serde(default)]
+    pub session_is_guardian: bool,
     pub session_id_from_meta: Option<String>,
     pub session_forked_from_id: Option<String>,
     pub forked_child_session_id: Option<String>,
@@ -246,8 +292,99 @@ pub(crate) struct CodexParseState {
     pub forked_child_is_user_fork: bool,
     #[serde(default)]
     pub previous_last_totals: Option<CodexTotals>,
+    /// Set when `session_meta.originator` names OpenClaw: this rollout records
+    /// turns OpenClaw drove through Codex app-server, so its usage belongs to
+    /// the `openclaw` client. Messages are emitted with `client = "openclaw"`
+    /// and the Codex thread id as their session id; the codex lane hands them
+    /// to the openclaw lane, which replaces OpenClaw's own last-response-only
+    /// mirror of those turns with them. `#[serde(default)]` keeps the decision
+    /// across incremental re-parses of appended chunks.
+    #[serde(default)]
+    pub session_owned_by_openclaw: bool,
+    /// `turn_id` of the turn being read, from its `task_started` /
+    /// `turn_context`. Attributes each token_count to the turn that produced
+    /// it, which is the granularity OpenClaw's transcript mirror uses when it
+    /// refers back to a Codex thread. `#[serde(default)]` keeps the current
+    /// turn across incremental re-parses.
     #[serde(default)]
     pub current_turn_id: Option<String>,
+    /// True while `current_turn_id` came from a `task_started` that neither
+    /// a `turn_context` nor any usage has followed yet. A `turn_context`
+    /// without an id then keeps the announced one; once the turn has a
+    /// `turn_context` or has produced usage, a `turn_context` without an id
+    /// starts a turn that has none. `#[serde(default)]` keeps it across
+    /// incremental re-parses.
+    #[serde(default)]
+    pub turn_id_announced_by_task_started: bool,
+    /// The turns this rollout has recorded usage for so far; see
+    /// [`CodexTurnCoverage`]. `#[serde(default)]` keeps it across incremental
+    /// re-parses, since a mirror row for an earlier turn still has to yield.
+    #[serde(default)]
+    pub turn_coverage: CodexTurnCoverage,
+}
+
+/// Which of a thread's turns a rollout recorded usage for.
+///
+/// OpenClaw mirrors each Codex app-server turn into its own transcript as one
+/// row with the last response's usage, keyed by `(thread id, turn id)`, and
+/// the lanes replace such a row with the rollout's complete record of that
+/// turn. The replacement has to be per turn, not per thread: a rollout that
+/// is truncated, or that had turns appended after it was read, covers only
+/// some of the turns its thread's mirror rows describe, and a mirror row for
+/// a turn the rollout does not hold is the only record of that turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CodexTurnCoverage {
+    /// Turn ids a usage message was emitted under.
+    pub turn_ids: std::collections::HashSet<String>,
+    /// Usage was emitted with no turn id in effect. Rollouts written before
+    /// Codex stamped `turn_id` on `turn_context` look like this; such a
+    /// rollout can only be matched to its mirror rows thread-wide.
+    pub without_turn_id: bool,
+}
+
+impl CodexTurnCoverage {
+    fn record(&mut self, turn_id: Option<&str>) {
+        match turn_id {
+            Some(turn_id) => {
+                self.turn_ids.insert(turn_id.to_string());
+            }
+            None => self.without_turn_id = true,
+        }
+    }
+}
+
+/// Client id the `codex` parser tags rollouts OpenClaw drove with.
+pub(crate) const OPENCLAW_CLIENT_ID: &str = "openclaw";
+
+/// Codex thread id from a rollout filename, `rollout-<timestamp>-<uuid>.jsonl`.
+///
+/// Used where a rollout's ownership comes from its location rather than its
+/// `session_meta.originator`, so the parser did not already put the thread id
+/// on its messages. Returns `None` for any other spelling rather than guessing.
+pub(crate) fn thread_id_from_rollout_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let stem = stem.strip_prefix("rollout-")?;
+    // `2026-08-30T10-00-00-` is 20 chars; everything after is the thread id.
+    let candidate = stem.get(20..)?;
+    let is_uuid = candidate.len() == 36
+        && candidate
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            });
+    is_uuid.then(|| candidate.to_string())
+}
+
+/// True when a `session_meta.originator` identifies OpenClaw as the client
+/// that drove the thread. OpenClaw sends `clientInfo.name: "openclaw"` on the
+/// app-server handshake; the comparison ignores case so a capitalized
+/// product name (`"OpenClaw"`) matches too.
+fn codex_originator_is_openclaw(originator: Option<&str>) -> bool {
+    originator
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("openclaw"))
 }
 
 #[derive(Debug, Clone)]
@@ -259,13 +396,6 @@ pub(crate) struct ParsedCodexFile {
     /// True when model-less token_count rows were emitted without a later model.
     pub unresolved_model_events: bool,
     pub state: CodexParseState,
-}
-
-fn session_id_from_path(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string()
 }
 
 fn codex_workspace_from_cwd(cwd: &str) -> (Option<String>, Option<String>) {
@@ -349,6 +479,27 @@ fn parse_codex_reader<R: BufRead>(
                 };
                 let event_model = payload_model.clone().or(info_model.clone());
 
+                // The turn the following token_count rows belong to. Both
+                // `task_started` and `turn_context` start a turn, so each
+                // replaces the current id — with `None` when it carries no
+                // `turn_id`, as older Codex wrote them, so that turn's usage
+                // is not attributed to the previous turn. The one exception:
+                // a `turn_context` without an id keeps the id its own
+                // `task_started` announced just before it.
+                if entry.entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("task_started")
+                {
+                    state.current_turn_id = payload.turn_id.clone();
+                    state.turn_id_announced_by_task_started = state.current_turn_id.is_some();
+                } else if entry.entry_type == "turn_context" {
+                    if payload.turn_id.is_some() {
+                        state.current_turn_id = payload.turn_id.clone();
+                    } else if !state.turn_id_announced_by_task_started {
+                        state.current_turn_id = None;
+                    }
+                    state.turn_id_announced_by_task_started = false;
+                }
+
                 if state.forked_child_waiting_for_turn_context {
                     if entry.entry_type == "turn_context"
                         && forked_child_turn_starts_own_session(&state, payload.turn_id.as_deref())
@@ -425,6 +576,14 @@ fn parse_codex_reader<R: BufRead>(
                 }
 
                 if entry.entry_type == "session_meta" {
+                    // Only the file's own metadata decides ownership. A forked
+                    // child replays its parent's `session_meta` too, and that
+                    // copy is skipped by the replay gate above, so a child the
+                    // user forked in Codex from an OpenClaw-driven thread stays
+                    // Codex usage.
+                    if codex_originator_is_openclaw(payload.originator.as_deref()) {
+                        state.session_owned_by_openclaw = true;
+                    }
                     if codex_source_is_exec(payload.source.as_ref()) {
                         state.session_is_headless = true;
                     }
@@ -456,9 +615,30 @@ fn parse_codex_reader<R: BufRead>(
                     if let Some(ref provider) = payload.model_provider {
                         state.session_provider = Some(provider.clone());
                     }
-                    if let Some(ref nickname) = payload.agent_nickname {
-                        state.session_agent = Some(nickname.clone());
+                    if codex_thread_is_guardian(
+                        payload.thread_source.as_deref(),
+                        payload.source.as_ref(),
+                    ) {
+                        state.session_is_guardian = true;
+                    } else if codex_thread_is_subagent(
+                        payload.thread_source.as_deref(),
+                        payload.source.as_ref(),
+                    ) {
+                        state.session_is_subagent = true;
                     }
+                    // Codex's per-thread `agent_nickname` is a random alias
+                    // (Popper, Dirac, …), not a role; bucket by thread kind
+                    // instead so the Agents tab stays aggregateable.
+                    state.session_agent = Some(
+                        if state.session_is_guardian {
+                            CODEX_GUARDIAN_AGENT
+                        } else if state.session_is_subagent {
+                            CODEX_SUBAGENT_AGENT
+                        } else {
+                            CODEX_DEFAULT_AGENT
+                        }
+                        .to_string(),
+                    );
                     if let Some(ref cwd) = payload.cwd {
                         let (workspace_key, workspace_label) = codex_workspace_from_cwd(cwd);
                         state.session_workspace_key = workspace_key;
@@ -472,7 +652,6 @@ fn parse_codex_reader<R: BufRead>(
                     state.current_turn_start_ms = turn_start_ms;
                     state.last_accepted_token_timestamp_ms = turn_start_ms;
                     state.previous_last_totals = None;
-                    state.current_turn_id = payload.turn_id.clone();
                     if let Some(model) = state.current_model.clone() {
                         flush_pending_model_messages(
                             &mut pending_model_messages,
@@ -510,7 +689,6 @@ fn parse_codex_reader<R: BufRead>(
                         state.last_accepted_token_timestamp_ms =
                             parse_codex_entry_timestamp(entry.timestamp.as_deref());
                         state.previous_last_totals = None;
-                        state.current_turn_id = None;
                     }
                     handled = true;
                 }
@@ -541,11 +719,16 @@ fn parse_codex_reader<R: BufRead>(
                     // dedup and monotonicity checks — never as a direct delta source.
                     let total_usage = info.total_token_usage.as_ref().map(CodexTotals::from_usage);
 
-                    let turn_id = payload.turn_id.as_deref().unwrap_or("no-turn-id").to_string();
-                    let is_new_turn = state.current_turn_id.as_ref() != Some(&turn_id);
-                    if is_new_turn {
-                        state.current_turn_id = Some(turn_id);
-                        state.previous_last_totals = None;
+                    // A token_count row may carry its own `turn_id`. When it
+                    // differs from the announced turn, usage starts over, so
+                    // reset the delta baseline. Do not write it (or a
+                    // sentinel) into `current_turn_id` — that field is the
+                    // announced turn driving `turn_coverage`, and a
+                    // synthesized id would collapse every turn into one.
+                    if let Some(turn_id) = payload.turn_id.as_deref() {
+                        if state.current_turn_id.as_deref() != Some(turn_id) {
+                            state.previous_last_totals = None;
+                        }
                     }
 
                     // Check if total grew while last did not, indicating a new turn session
@@ -650,7 +833,7 @@ fn parse_codex_reader<R: BufRead>(
                     );
 
                     let agent = if state.session_is_headless {
-                        Some("headless".to_string())
+                        Some(CODEX_HEADLESS_AGENT.to_string())
                     } else {
                         state.session_agent.clone()
                     };
@@ -661,17 +844,34 @@ fn parse_codex_reader<R: BufRead>(
                         .or_else(|| model.as_deref().and_then(inferred_provider_from_model))
                         .unwrap_or("openai");
 
+                    // A rollout OpenClaw drove is OpenClaw's usage: tag it so
+                    // and key it by the Codex thread id, which is what
+                    // OpenClaw's transcript mirror names when it refers back
+                    // to this thread.
+                    let (client, message_session_id) = if state.session_owned_by_openclaw {
+                        (
+                            OPENCLAW_CLIENT_ID,
+                            state.session_id_from_meta.as_deref().unwrap_or(session_id),
+                        )
+                    } else {
+                        ("codex", session_id)
+                    };
                     let mut message = UnifiedMessage::new_with_agent(
-                        "codex",
+                        client,
                         model.clone().unwrap_or_else(|| "unknown".to_string()),
                         provider,
-                        session_id.to_string(),
+                        message_session_id.to_string(),
                         timestamp,
                         tokens,
                         0.0,
                         agent,
                     );
                     message.duration_ms = duration_ms;
+                    state.turn_coverage.record(state.current_turn_id.as_deref());
+                    // The announced turn has produced usage, so it is under
+                    // way: a `turn_context` without an id that comes later
+                    // starts another turn, not this one.
+                    state.turn_id_announced_by_task_started = false;
                     // Apply a deferred human-turn marker from a preceding
                     // user_message to this assistant reply — the first
                     // token-bearing message after the human input.
@@ -694,8 +894,9 @@ fn parse_codex_reader<R: BufRead>(
                         // forked_child_waiting_for_turn_context gate above) needs the
                         // parent scope to dedup across files.
                         let dedup_scope_id = state
-                            .session_id_from_meta
+                            .session_forked_from_id
                             .as_deref()
+                            .or(state.session_id_from_meta.as_deref())
                             .unwrap_or(session_id);
                         set_codex_dedup_key(
                             &mut message,
@@ -810,6 +1011,22 @@ fn parse_codex_reader<R: BufRead>(
 
 fn codex_source_is_exec(source: Option<&Value>) -> bool {
     source.and_then(Value::as_str) == Some("exec")
+}
+
+fn codex_thread_is_guardian(thread_source: Option<&str>, source: Option<&Value>) -> bool {
+    thread_source == Some("guardian_review")
+        || source
+            .and_then(|source| source.get("subagent"))
+            .and_then(|subagent| subagent.get("other"))
+            .and_then(Value::as_str)
+            == Some("guardian")
+}
+
+/// Any `source.subagent` variant counts, not only the `thread_spawn` shape
+/// `forked_from_id_from_source` reads, so a subagent kind the parser does not
+/// model still stays out of the interactive bucket.
+fn codex_thread_is_subagent(thread_source: Option<&str>, source: Option<&Value>) -> bool {
+    thread_source == Some("subagent") || source.and_then(|source| source.get("subagent")).is_some()
 }
 
 fn forked_from_id_from_source(source: Option<&Value>) -> Option<&str> {
@@ -1189,7 +1406,7 @@ fn parse_codex_headless_line(
         .or_else(|| inferred_provider_from_model(&model))
         .unwrap_or("openai");
     let agent = if session_is_headless {
-        Some("headless".to_string())
+        Some(CODEX_HEADLESS_AGENT.to_string())
     } else {
         session_agent.clone()
     };
@@ -1504,15 +1721,15 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let performance = &entries[0].performance;
         assert_eq!(performance.total_duration_ms, 7_000);
-        assert_eq!(performance.timed_tokens, 170);
+        assert_eq!(performance.timed_tokens, 160);
         assert_eq!(performance.sample_count, 3);
         assert_eq!(performance.token_coverage, 1.0);
-        let expected_ms_per_1k = 7_000.0 * 1_000.0 / 170.0;
+        let expected_ms_per_1k = 7_000.0 * 1_000.0 / 160.0;
         assert!((performance.ms_per_1k_tokens.unwrap() - expected_ms_per_1k).abs() < f64::EPSILON);
 
         let json = serde_json::to_value(performance).unwrap();
         assert_eq!(json["totalDurationMs"], 7_000);
-        assert_eq!(json["timedTokens"], 170);
+        assert_eq!(json["timedTokens"], 160);
         assert_eq!(json["sampleCount"], 3);
         assert_eq!(json["tokenCoverage"], 1.0);
         assert!(json["msPer1KTokens"].is_number());
@@ -1630,7 +1847,7 @@ mod tests {
             ]
         );
         assert_eq!(messages[0].tokens.input, 8);
-        assert_eq!(messages[0].tokens.output, 3);
+        assert_eq!(messages[0].tokens.output, 2);
         assert_eq!(messages[0].tokens.cache_read, 2);
         assert_eq!(messages[0].tokens.reasoning, 1);
         assert_eq!(messages[1].tokens.input, 4);
@@ -1638,7 +1855,7 @@ mod tests {
         assert_eq!(messages[1].tokens.cache_read, 1);
         assert_eq!(messages[1].tokens.reasoning, 0);
         assert_eq!(messages[2].tokens.input, 6);
-        assert_eq!(messages[2].tokens.output, 2);
+        assert_eq!(messages[1].tokens.output, 2);
         assert_eq!(messages[2].tokens.cache_read, 1);
         assert_eq!(messages[2].tokens.reasoning, 1);
 
@@ -1756,7 +1973,317 @@ mod tests {
         let messages = parse_codex_file(file.path());
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].agent.as_deref(), Some("headless"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_HEADLESS_AGENT));
+    }
+
+    #[test]
+    fn test_session_meta_openclaw_originator_retags_the_rollout_as_openclaw() {
+        // OpenClaw drives Codex app-server with `clientInfo.name: "openclaw"`,
+        // which Codex records as the rollout's originator. The turns are
+        // OpenClaw's usage, so they leave the parser tagged `openclaw` and
+        // keyed by the Codex thread id instead of the file stem.
+        let line1 = r#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"thread-1","originator":"openclaw","cli_version":"0.120.0","source":"cli","model_provider":"openai","cwd":"/Users/alice/.openclaw/workspace"}}"#;
+        let line2 = r#"{"timestamp":"2026-08-30T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#;
+        let line3 = r#"{"timestamp":"2026-08-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#;
+        let content = format!("{}\n{}\n{}\n", line1, line2, line3);
+        let file = create_test_file(&content);
+
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert!(parsed.parse_succeeded);
+        assert!(parsed.state.session_owned_by_openclaw);
+        assert_eq!(parsed.consumed_offset, content.len() as u64);
+        assert_eq!(parsed.messages.len(), 1);
+        let message = &parsed.messages[0];
+        assert_eq!(message.client, "openclaw");
+        assert_eq!(message.session_id, "thread-1");
+        assert_eq!(message.model_id, "gpt-5.2-codex");
+        assert_eq!(message.provider_id, "openai");
+        assert_eq!(message.tokens.input, 80);
+        assert_eq!(message.tokens.cache_read, 20);
+        assert_eq!(message.tokens.output, 30);
+
+        // Case only differs by product spelling; still OpenClaw.
+        let capitalized =
+            content.replace(r#""originator":"openclaw""#, r#""originator":"OpenClaw""#);
+        let file = create_test_file(&capitalized);
+        let messages = parse_codex_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].client, "openclaw");
+    }
+
+    #[test]
+    fn test_openclaw_ownership_survives_incremental_resume() {
+        let head = concat!(
+            r#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"thread-1","originator":"openclaw","source":"cli","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#,
+            "\n"
+        );
+        let file = create_test_file(head);
+        let first = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert!(first.messages.is_empty());
+        assert!(first.state.session_owned_by_openclaw);
+        assert_eq!(first.consumed_offset, head.len() as u64);
+
+        // A later turn appends token counts; the resumed parse never re-reads
+        // the session_meta line, so ownership has to come from the state.
+        let tail = concat!(
+            r#"{"timestamp":"2026-08-30T10:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+            "\n"
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(file.path())
+            .unwrap()
+            .write_all(tail.as_bytes())
+            .unwrap();
+
+        let resumed = parse_codex_file_incremental(file.path(), first.consumed_offset, first.state);
+        assert_eq!(resumed.messages.len(), 1);
+        assert_eq!(resumed.messages[0].client, "openclaw");
+        assert_eq!(resumed.messages[0].session_id, "thread-1");
+        assert_eq!(resumed.consumed_offset, (head.len() + tail.len()) as u64);
+    }
+
+    #[test]
+    fn test_other_originators_stay_codex() {
+        for originator in ["codex_cli_rs", "codex-tui", "Codex Desktop", "codex_exec"] {
+            let line1 = format!(
+                r#"{{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{{"id":"thread-1","originator":"{originator}","source":"cli","model_provider":"openai"}}}}"#
+            );
+            let line2 = r#"{"timestamp":"2026-08-30T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
+            let line3 = r#"{"timestamp":"2026-08-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#;
+            let file = create_test_file(&format!("{}\n{}\n{}", line1, line2, line3));
+            let messages = parse_codex_file(file.path());
+            assert_eq!(
+                messages.len(),
+                1,
+                "originator {originator:?} must keep parsing"
+            );
+            assert_eq!(messages[0].client, "codex");
+            assert_ne!(messages[0].session_id, "thread-1");
+        }
+    }
+
+    #[test]
+    fn test_replayed_parent_originator_does_not_claim_a_forked_child() {
+        // A child the user forked in Codex from an OpenClaw-driven thread
+        // replays the parent's session_meta (originator openclaw) before its
+        // own turns. Ownership comes from the child's own metadata only.
+        let child_by_user = concat!(
+            r#"{"timestamp":"2026-08-30T10:01:00Z","type":"session_meta","payload":{"id":"child","forked_from_id":"parent","originator":"Codex Desktop","source":"vscode","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"parent","originator":"openclaw","source":"cli","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:01:02Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:01:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":30,"output_tokens":45},"last_token_usage":{"input_tokens":50,"cached_input_tokens":10,"output_tokens":15}}}}"#,
+            "\n"
+        );
+        let file = create_test_file(child_by_user);
+        let messages = parse_codex_file(file.path());
+        assert!(!messages.is_empty());
+        assert!(messages.iter().all(|m| m.client == "codex"), "{messages:?}");
+
+        // The mirror image: OpenClaw forked the thread itself.
+        let child_by_openclaw = child_by_user.replace(
+            r#""id":"child","forked_from_id":"parent","originator":"Codex Desktop""#,
+            r#""id":"child","forked_from_id":"parent","originator":"openclaw""#,
+        );
+        let file = create_test_file(&child_by_openclaw);
+        let messages = parse_codex_file(file.path());
+        assert!(!messages.is_empty());
+        assert!(
+            messages.iter().all(|m| m.client == "openclaw"),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().all(|m| m.session_id == "child"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_turn_coverage_records_the_turns_usage_was_emitted_under() {
+        // OpenClaw's transcript mirrors a Codex turn by (thread, turn id), so
+        // a rollout has to say which turns it holds usage for. Either of
+        // `task_started` and `turn_context` announces a turn; the coverage
+        // survives an incremental resume; a rollout written before Codex
+        // stamped turn ids can only be matched thread-wide and says so.
+        let turn_a = concat!(
+            r#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"thread-1","originator":"openclaw","source":"cli","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1756548001}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:01Z","type":"turn_context","payload":{"turn_id":"turn-a","model":"gpt-5.2-codex"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+            "\n",
+        );
+        let later_turns = concat!(
+            // Announced by `turn_context` alone.
+            r#"{"timestamp":"2026-08-30T10:01:01Z","type":"turn_context","payload":{"turn_id":"turn-b","model":"gpt-5.2-codex"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:01:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":250,"cached_input_tokens":40,"output_tokens":75},"last_token_usage":{"input_tokens":150,"cached_input_tokens":20,"output_tokens":45}}}}"#,
+            "\n",
+            // Announced by `task_started` alone.
+            r#"{"timestamp":"2026-08-30T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-c","started_at":1756548121}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:02:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":400,"cached_input_tokens":60,"output_tokens":100},"last_token_usage":{"input_tokens":150,"cached_input_tokens":20,"output_tokens":25}}}}"#,
+            "\n",
+        );
+        let expected_turns = |turns: &[&str]| CodexTurnCoverage {
+            turn_ids: turns.iter().map(|turn| turn.to_string()).collect(),
+            without_turn_id: false,
+        };
+
+        let file = create_test_file(&format!("{turn_a}{later_turns}"));
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(
+            parsed.state.turn_coverage,
+            expected_turns(&["turn-a", "turn-b", "turn-c"])
+        );
+
+        // Read in two chunks, the way the cache resumes an appended rollout.
+        let file = create_test_file(turn_a);
+        let first = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(first.state.turn_coverage, expected_turns(&["turn-a"]));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(file.path())
+            .unwrap()
+            .write_all(later_turns.as_bytes())
+            .unwrap();
+        let resumed = parse_codex_file_incremental(file.path(), first.consumed_offset, first.state);
+        assert_eq!(resumed.messages.len(), 2);
+        assert_eq!(
+            resumed.state.turn_coverage,
+            expected_turns(&["turn-a", "turn-b", "turn-c"])
+        );
+
+        // No turn ids anywhere: usage was emitted, but under no turn.
+        let unstamped = turn_a
+            .replace(r#""turn_id":"turn-a","#, "")
+            .replace(r#"{"turn_id":"turn-a","model""#, r#"{"model""#);
+        assert!(!unstamped.contains("turn_id"), "{unstamped}");
+        let file = create_test_file(&unstamped);
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(
+            parsed.state.turn_coverage,
+            CodexTurnCoverage {
+                turn_ids: Default::default(),
+                without_turn_id: true,
+            }
+        );
+
+        // A turn that arrives without an id after turns that had one (a
+        // resume under an older Codex) must not be attributed to the last
+        // identified turn: it is usage without a turn id.
+        let unstamped_later = format!(
+            "{turn_a}{}",
+            concat!(
+                r#"{"timestamp":"2026-08-30T10:03:01Z","type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:03:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":70,"output_tokens":120},"last_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":20}}}}"#,
+                "\n",
+            )
+        );
+        let file = create_test_file(&unstamped_later);
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(
+            parsed.state.turn_coverage,
+            CodexTurnCoverage {
+                turn_ids: ["turn-a".to_string()].into_iter().collect(),
+                without_turn_id: true,
+            }
+        );
+
+        // A `turn_context` without an id right after its own `task_started`
+        // keeps the announced id.
+        let announced_only = format!(
+            "{turn_a}{}",
+            concat!(
+                r#"{"timestamp":"2026-08-30T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-d","started_at":1756548181}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:03:01Z","type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:03:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":70,"output_tokens":120},"last_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":20}}}}"#,
+                "\n",
+            )
+        );
+        let file = create_test_file(&announced_only);
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(
+            parsed.state.turn_coverage,
+            expected_turns(&["turn-a", "turn-d"])
+        );
+
+        // Once the announced turn has produced usage, a later `turn_context`
+        // without an id is another turn, not a late confirmation of that
+        // one: its usage is recorded without a turn id.
+        let announced_then_unstamped = format!(
+            "{turn_a}{}",
+            concat!(
+                r#"{"timestamp":"2026-08-30T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-d","started_at":1756548181}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:03:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":70,"output_tokens":120},"last_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":20}}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:04:01Z","type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:04:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":700,"cached_input_tokens":90,"output_tokens":150},"last_token_usage":{"input_tokens":200,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+                "\n",
+            )
+        );
+        let file = create_test_file(&announced_then_unstamped);
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(
+            parsed.state.turn_coverage,
+            CodexTurnCoverage {
+                turn_ids: ["turn-a", "turn-d"]
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect(),
+                without_turn_id: true,
+            }
+        );
+
+        // A rollout with no usage covers nothing.
+        let file = create_test_file(
+            r#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"thread-1","originator":"openclaw"}}
+{"timestamp":"2026-08-30T10:00:01Z","type":"turn_context","payload":{"turn_id":"turn-a","model":"gpt-5.2-codex"}}
+"#,
+        );
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert!(parsed.messages.is_empty());
+        assert_eq!(parsed.state.turn_coverage, CodexTurnCoverage::default());
+    }
+
+    #[test]
+    fn test_thread_id_from_rollout_path() {
+        assert_eq!(
+            thread_id_from_rollout_path(Path::new(
+                "/x/codex-home/sessions/2026/08/30/rollout-2026-08-30T10-00-00-0192f3a4-5b6c-7d8e-9f01-23456789abcd.jsonl"
+            ))
+            .as_deref(),
+            Some("0192f3a4-5b6c-7d8e-9f01-23456789abcd")
+        );
+        assert_eq!(
+            thread_id_from_rollout_path(Path::new("/x/session.jsonl")),
+            None
+        );
+        assert_eq!(
+            thread_id_from_rollout_path(Path::new(
+                "/x/rollout-2026-08-30T10-00-00-not-a-uuid.jsonl"
+            )),
+            None
+        );
     }
 
     #[test]
@@ -1771,7 +2298,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.input, 80);
-        assert_eq!(messages[0].tokens.output, 30);
+        assert_eq!(messages[0].tokens.output, 25);
         assert_eq!(messages[0].tokens.cache_read, 20);
         assert_eq!(messages[0].tokens.reasoning, 5);
     }
@@ -1788,11 +2315,11 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].tokens.input, 80);
-        assert_eq!(messages[0].tokens.output, 30);
+        assert_eq!(messages[0].tokens.output, 25);
         assert_eq!(messages[0].tokens.cache_read, 20);
         assert_eq!(messages[0].tokens.reasoning, 5);
         assert_eq!(messages[1].tokens.input, 8);
-        assert_eq!(messages[1].tokens.output, 3);
+        assert_eq!(messages[1].tokens.output, 2);
         assert_eq!(messages[1].tokens.cache_read, 2);
         assert_eq!(messages[1].tokens.reasoning, 1);
     }
@@ -1810,11 +2337,11 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].tokens.input, 80);
-        assert_eq!(messages[0].tokens.output, 30);
+        assert_eq!(messages[0].tokens.output, 25);
         assert_eq!(messages[0].tokens.cache_read, 20);
         assert_eq!(messages[0].tokens.reasoning, 5);
         assert_eq!(messages[1].tokens.input, 8);
-        assert_eq!(messages[1].tokens.output, 3);
+        assert_eq!(messages[1].tokens.output, 2);
         assert_eq!(messages[1].tokens.cache_read, 2);
         assert_eq!(messages[1].tokens.reasoning, 1);
     }
@@ -1839,14 +2366,58 @@ mod tests {
         assert_eq!(messages.len(), 2);
         // First message: full total
         assert_eq!(messages[0].tokens.input, 80);
-        assert_eq!(messages[0].tokens.output, 30);
+        assert_eq!(messages[0].tokens.output, 25);
         assert_eq!(messages[0].tokens.cache_read, 20);
         assert_eq!(messages[0].tokens.reasoning, 5);
         // Second message: delta from 50→80
         assert_eq!(messages[1].tokens.input, 25);
-        assert_eq!(messages[1].tokens.output, 10);
+        assert_eq!(messages[1].tokens.output, 8);
         assert_eq!(messages[1].tokens.cache_read, 5);
         assert_eq!(messages[1].tokens.reasoning, 2);
+    }
+
+    #[test]
+    fn test_into_tokens_splits_reasoning_out_of_output() {
+        // A real `token_count` snapshot from ~/.codex/sessions. Codex reports
+        // `total_tokens == input_tokens + output_tokens`, with
+        // `reasoning_output_tokens` counted inside `output_tokens` rather than
+        // beside it.
+        let totals = CodexTotals {
+            input: 16_845_360,
+            output: 63_820,
+            cached: 16_358_912,
+            reasoning: 24_882,
+        };
+        let reported_total = totals.input + totals.output; // 16_909_180
+
+        let tokens = totals.into_tokens();
+
+        // Conservation: the additive buckets must land back on Codex's own
+        // total. This only holds when reasoning was split out of output; if the
+        // split regresses, the sum overshoots by exactly the reasoning count.
+        assert_eq!(tokens.total(), reported_total);
+        assert_eq!(tokens.reasoning, 24_882);
+        assert_eq!(tokens.output, 63_820 - 24_882);
+        assert_eq!(tokens.cache_read, 16_358_912);
+        assert_eq!(tokens.input, 16_845_360 - 16_358_912);
+    }
+
+    #[test]
+    fn test_into_tokens_clamps_reasoning_to_output() {
+        // A malformed row claiming more reasoning than output must not drive
+        // the output bucket negative, and must not inflate the total.
+        let totals = CodexTotals {
+            input: 100,
+            output: 10,
+            cached: 0,
+            reasoning: 999,
+        };
+
+        let tokens = totals.into_tokens();
+
+        assert_eq!(tokens.output, 0);
+        assert_eq!(tokens.reasoning, 10);
+        assert_eq!(tokens.total(), 110);
     }
 
     #[test]
@@ -1862,8 +2433,11 @@ mod tests {
         let tokens = totals.into_tokens();
         assert_eq!(tokens.cache_read, 50); // Clamped to input
         assert_eq!(tokens.input, 0); // input - clamped_cached = 0
-        assert_eq!(tokens.output, 30);
+                                     // Reasoning is a subset of output, so the output bucket carries only
+                                     // the non-reasoning remainder.
+        assert_eq!(tokens.output, 25);
         assert_eq!(tokens.reasoning, 5);
+        assert_eq!(tokens.total(), 80); // 0 + 25 + 50 + 0 + 5
     }
 
     #[test]
@@ -1879,11 +2453,11 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].tokens.input, 80);
-        assert_eq!(messages[0].tokens.output, 30);
+        assert_eq!(messages[0].tokens.output, 25);
         assert_eq!(messages[0].tokens.cache_read, 20);
         assert_eq!(messages[0].tokens.reasoning, 5);
         assert_eq!(messages[1].tokens.input, 8);
-        assert_eq!(messages[1].tokens.output, 3);
+        assert_eq!(messages[1].tokens.output, 2);
         assert_eq!(messages[1].tokens.cache_read, 2);
         assert_eq!(messages[1].tokens.reasoning, 1);
     }
@@ -1902,12 +2476,12 @@ mod tests {
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].tokens.input, 80);
-        assert_eq!(messages[0].tokens.output, 30);
+        assert_eq!(messages[0].tokens.output, 25);
         assert_eq!(messages[0].tokens.cache_read, 20);
         assert_eq!(messages[0].tokens.reasoning, 5);
 
         assert_eq!(messages[1].tokens.input, 8);
-        assert_eq!(messages[1].tokens.output, 3);
+        assert_eq!(messages[1].tokens.output, 2);
         assert_eq!(messages[1].tokens.cache_read, 2);
         assert_eq!(messages[1].tokens.reasoning, 1);
 
@@ -1962,17 +2536,17 @@ mod tests {
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].tokens.input, 9000);
-        assert_eq!(messages[0].tokens.output, 400);
+        assert_eq!(messages[0].tokens.output, 350);
         assert_eq!(messages[0].tokens.cache_read, 1000);
         assert_eq!(messages[0].tokens.reasoning, 50);
 
         assert_eq!(messages[1].tokens.input, 20);
-        assert_eq!(messages[1].tokens.output, 4);
+        assert_eq!(messages[1].tokens.output, 3);
         assert_eq!(messages[1].tokens.cache_read, 5);
         assert_eq!(messages[1].tokens.reasoning, 1);
 
         assert_eq!(messages[2].tokens.input, 20);
-        assert_eq!(messages[2].tokens.output, 4);
+        assert_eq!(messages[2].tokens.output, 3);
         assert_eq!(messages[2].tokens.cache_read, 5);
         assert_eq!(messages[2].tokens.reasoning, 1);
     }
@@ -1989,11 +2563,11 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].tokens.input, 10);
-        assert_eq!(messages[0].tokens.output, 5);
+        assert_eq!(messages[0].tokens.output, 4);
         assert_eq!(messages[0].tokens.cache_read, 2);
         assert_eq!(messages[0].tokens.reasoning, 1);
         assert_eq!(messages[1].tokens.input, 10);
-        assert_eq!(messages[1].tokens.output, 5);
+        assert_eq!(messages[1].tokens.output, 4);
         assert_eq!(messages[1].tokens.cache_read, 2);
         assert_eq!(messages[1].tokens.reasoning, 1);
     }
@@ -2011,11 +2585,11 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].tokens.input, 450);
-        assert_eq!(messages[0].tokens.output, 80);
+        assert_eq!(messages[0].tokens.output, 70);
         assert_eq!(messages[0].tokens.cache_read, 50);
         assert_eq!(messages[0].tokens.reasoning, 10);
         assert_eq!(messages[1].tokens.input, 8);
-        assert_eq!(messages[1].tokens.output, 3);
+        assert_eq!(messages[1].tokens.output, 2);
         assert_eq!(messages[1].tokens.cache_read, 2);
         assert_eq!(messages[1].tokens.reasoning, 1);
     }
@@ -2046,7 +2620,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "azure");
-        assert_eq!(messages[0].agent.as_deref(), Some("my-agent"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_DEFAULT_AGENT));
     }
 
     #[test]
@@ -2064,12 +2638,65 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "openai");
-        assert_eq!(messages[0].agent.as_deref(), Some("worker"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_SUBAGENT_AGENT));
         assert_eq!(
             messages[0].workspace_key.as_deref(),
             Some("/Users/alice/codex-fork")
         );
         assert!(messages[0].dedup_key.is_some());
+    }
+
+    fn single_turn_agent(session_meta_lines: &str) -> Option<String> {
+        let file = create_test_file(&format!(
+            "{session_meta_lines}\n{}\n{}\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        messages[0].agent.clone()
+    }
+
+    #[test]
+    fn test_guardian_review_thread_gets_guardian_agent() {
+        let agent = single_turn_agent(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"guardian-thread","parent_thread_id":"parent-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review","model_provider":"openai","cwd":"/repo"}}"#,
+        );
+
+        assert_eq!(agent.as_deref(), Some(CODEX_GUARDIAN_AGENT));
+    }
+
+    #[test]
+    fn test_guardian_thread_tagged_subagent_gets_guardian_agent() {
+        // Older Codex builds tagged the same guardian thread
+        // `thread_source: "subagent"`; it must not land in the subagent row.
+        let agent = single_turn_agent(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"guardian-thread","parent_thread_id":"parent-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent","model_provider":"openai","cwd":"/repo"}}"#,
+        );
+
+        assert_eq!(agent.as_deref(), Some(CODEX_GUARDIAN_AGENT));
+    }
+
+    #[test]
+    fn test_non_spawn_subagent_source_gets_subagent_agent() {
+        let agent = single_turn_agent(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"review-thread","source":{"subagent":"review"},"model_provider":"openai","cwd":"/repo"}}"#,
+        );
+
+        assert_eq!(agent.as_deref(), Some(CODEX_SUBAGENT_AGENT));
+    }
+
+    #[test]
+    fn test_later_session_meta_keeps_guardian_agent() {
+        let agent = single_turn_agent(concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"guardian-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review","model_provider":"openai","cwd":"/repo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:00.500Z","type":"session_meta","payload":{"id":"parent-thread","source":"vscode","thread_source":"user","model_provider":"openai","cwd":"/repo"}}"#,
+        ));
+
+        assert_eq!(agent.as_deref(), Some(CODEX_GUARDIAN_AGENT));
     }
 
     #[test]
@@ -2096,11 +2723,11 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "gpt-5.5");
         assert_eq!(messages[0].provider_id, "openai");
-        assert_eq!(messages[0].agent.as_deref(), Some("worker"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_SUBAGENT_AGENT));
         assert_eq!(messages[0].workspace_key.as_deref(), Some("/repo-child"));
         assert_eq!(messages[0].tokens.input, 500);
         assert_eq!(messages[0].tokens.cache_read, 1000);
-        assert_eq!(messages[0].tokens.output, 200);
+        assert_eq!(messages[0].tokens.output, 150);
         assert_eq!(messages[0].tokens.reasoning, 50);
     }
 
@@ -2152,7 +2779,7 @@ mod tests {
         assert_eq!(messages[0].model_id, "gpt-5.5");
         assert_eq!(messages[0].tokens.input, 500);
         assert_eq!(messages[0].tokens.cache_read, 1000);
-        assert_eq!(messages[0].tokens.output, 200);
+        assert_eq!(messages[0].tokens.output, 150);
         assert_eq!(messages[0].tokens.reasoning, 50);
     }
 
@@ -2566,7 +3193,7 @@ mod tests {
         assert_eq!(incremental.messages.len(), 1);
         assert_eq!(incremental.messages[0].tokens.input, 500);
         assert_eq!(incremental.messages[0].tokens.cache_read, 1000);
-        assert_eq!(incremental.messages[0].tokens.output, 200);
+        assert_eq!(incremental.messages[0].tokens.output, 150);
         assert_eq!(incremental.messages[0].tokens.reasoning, 50);
     }
 
@@ -2600,7 +3227,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.input, 8);
-        assert_eq!(messages[0].tokens.output, 3);
+        assert_eq!(messages[0].tokens.output, 2);
         assert_eq!(messages[0].tokens.cache_read, 2);
         assert_eq!(
             messages[0].workspace_key.as_deref(),
@@ -2686,14 +3313,14 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].tokens.input, 45);
-        assert_eq!(messages[1].tokens.output, 10);
+        assert_eq!(messages[1].tokens.output, 8);
         assert_eq!(messages[1].tokens.cache_read, 5);
         assert_eq!(messages[1].tokens.reasoning, 2);
     }
 
     #[test]
     fn test_headless_fallback_uses_session_provider_and_agent() {
-        // session_meta sets provider to "azure" and agent to "my-bot",
+        // session_meta sets provider to "azure" and the default agent bucket,
         // then a line falls through to headless parsing (no structured entry_type)
         let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"model_provider":"azure","agent_nickname":"my-bot"}}"#;
         let line2 = r#"{"type":"turn.completed","model":"gpt-4o","usage":{"input_tokens":100,"output_tokens":50}}"#;
@@ -2704,7 +3331,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "azure");
-        assert_eq!(messages[0].agent.as_deref(), Some("my-bot"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_DEFAULT_AGENT));
     }
 
     #[test]
@@ -2845,7 +3472,7 @@ mod tests {
             messages[0].is_turn_start,
             "an exec one-shot with a human prompt counts as one turn"
         );
-        assert_eq!(messages[0].agent.as_deref(), Some("headless"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_HEADLESS_AGENT));
     }
 
     #[test]

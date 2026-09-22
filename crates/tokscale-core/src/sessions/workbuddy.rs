@@ -4,11 +4,10 @@
 //! Older installs also expose an aggregate `~/.workbuddy/workbuddy.db`; that
 //! database is kept as a fallback when detailed token sources are unavailable.
 
+use super::utils::sqlite_for_each_row;
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
-use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
-use tracing::warn;
 
 const DEFAULT_MODEL: &str = "workbuddy";
 
@@ -42,23 +41,7 @@ struct WorkBuddyUsageRow {
 }
 
 pub fn parse_workbuddy_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
-    let conn = match Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(conn) => conn,
-        Err(err) => {
-            warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "Failed to open WorkBuddy database"
-            );
-            return Vec::new();
-        }
-    };
-
-    let mut stmt = match conn.prepare(
-        r#"
+    let query = r#"
         SELECT
             su.session_id,
             su.used,
@@ -71,51 +54,21 @@ pub fn parse_workbuddy_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
           AND su.used > 0
           AND su.updated_at IS NOT NULL
           AND su.updated_at > 0
-        "#,
-    ) {
-        Ok(stmt) => stmt,
-        Err(err) => {
-            warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "Failed to prepare WorkBuddy usage query"
-            );
-            return Vec::new();
-        }
-    };
+        "#;
 
-    let rows = match stmt.query_map([], |row| {
-        Ok(WorkBuddyUsageRow {
+    let mut messages = Vec::new();
+    sqlite_for_each_row(db_path, query, Some("WorkBuddy usage"), &mut |row| {
+        messages.push(usage_row_to_message(WorkBuddyUsageRow {
             session_id: row.get(0)?,
             used: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
             updated_at: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
             model: row.get(3)?,
             cwd: row.get(4)?,
-        })
-    }) {
-        Ok(rows) => rows,
-        Err(err) => {
-            warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "Failed to execute WorkBuddy usage query"
-            );
-            return Vec::new();
-        }
-    };
+        }));
+        Ok(())
+    });
 
-    rows.filter_map(|row| match row {
-        Ok(row) => Some(usage_row_to_message(row)),
-        Err(err) => {
-            warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "Failed to decode WorkBuddy usage row"
-            );
-            None
-        }
-    })
-    .collect()
+    messages
 }
 
 fn usage_row_to_message(row: WorkBuddyUsageRow) -> UnifiedMessage {
@@ -169,6 +122,13 @@ fn normalize_timestamp_ms(timestamp: i64) -> i64 {
 mod tests {
     use super::*;
     use rusqlite::{params, Connection};
+
+    #[test]
+    fn parse_workbuddy_sqlite_returns_empty_for_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.db");
+        assert!(parse_workbuddy_sqlite(&missing).is_empty());
+    }
 
     fn create_workbuddy_db(path: &Path) -> Connection {
         let conn = Connection::open(path).unwrap();
@@ -248,7 +208,9 @@ mod tests {
         let path = dir.path().join("session-1.jsonl");
         std::fs::write(
             &path,
-            r#"{"id":"call-1","timestamp":1780000000100,"type":"function_call","sessionId":"session-1","cwd":"/Users/alice/admin-panel","providerData":{"requestModelId":"glm-5.2","messageId":"msg-1","rawUsage":{"prompt_tokens":64700,"completion_tokens":635,"prompt_cache_hit_tokens":76032}}}"#,
+            // The reported total proves prompt_tokens includes the cached hit,
+            // so the parser can safely split the cache-exclusive input.
+            r#"{"id":"call-1","timestamp":1780000000100,"type":"function_call","sessionId":"session-1","cwd":"/Users/alice/admin-panel","providerData":{"requestModelId":"glm-5.2","messageId":"msg-1","rawUsage":{"prompt_tokens":140732,"completion_tokens":635,"total_tokens":141367,"prompt_cache_hit_tokens":76032}}}"#,
         )
         .unwrap();
 

@@ -1,10 +1,9 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use super::widgets::{
-    format_cost, get_client_display_name, total_tokens_cell, viewport_scrollbar_state,
+    ambient_stable_scrollbar, format_cost, get_client_display_name, total_tokens_cell,
+    truncate_text, viewport_scrollbar_state, AMBIENT_STABLE_BORDER_SET,
 };
 use crate::tui::app::{App, SortDirection, SortField};
 use crate::ClientFilter;
@@ -12,6 +11,7 @@ use crate::ClientFilter;
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " Agents ",
@@ -58,8 +58,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_indicator = |field: SortField| -> &'static str {
         if sort_field == field {
             match sort_direction {
-                SortDirection::Ascending => " ▲",
-                SortDirection::Descending => " ▼",
+                SortDirection::Ascending => " ▴",
+                SortDirection::Descending => " ▾",
             }
         } else {
             ""
@@ -108,13 +108,13 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
             let cells: Vec<Cell> = if is_very_narrow {
                 vec![
-                    Cell::from(truncate(&agent.agent, 18))
+                    Cell::from(truncate_text(&agent.agent, 18))
                         .style(Style::default().fg(app.theme.foreground)),
                     Cell::from(format_cost(agent.cost)).style(Style::default().fg(Color::Green)),
                 ]
             } else if is_narrow {
                 vec![
-                    Cell::from(truncate(&agent.agent, 18))
+                    Cell::from(truncate_text(&agent.agent, 18))
                         .style(Style::default().fg(app.theme.foreground)),
                     total_tokens_cell(agent.tokens.total(), &app.theme),
                     Cell::from(format_cost(agent.cost)).style(Style::default().fg(Color::Green)),
@@ -122,12 +122,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 vec![
                     Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
-                    Cell::from(truncate(&agent.agent, 32)).style(
+                    Cell::from(truncate_text(&agent.agent, 32)).style(
                         Style::default()
                             .fg(app.theme.foreground)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Cell::from(truncate(&client_labels(&agent.clients), 24))
+                    Cell::from(truncate_text(&client_labels(&agent.clients), 24))
                         .style(Style::default().fg(theme_muted)),
                     total_tokens_cell(agent.tokens.total(), &app.theme),
                     Cell::from(format_cost(agent.cost)).style(Style::default().fg(Color::Green)),
@@ -174,9 +174,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(table, inner);
 
     if agents_len > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(agents_len, scroll_offset, visible_height);
@@ -216,21 +214,6 @@ fn client_labels(clients: &str) -> String {
         .join(", ")
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let char_count = s.chars().count();
-    if char_count <= max_chars {
-        s.to_string()
-    } else if max_chars <= 3 {
-        s.chars().take(max_chars).collect()
-    } else {
-        let head: String = s.chars().take(max_chars - 3).collect();
-        format!("{}...", head)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::get_empty_message;
@@ -249,6 +232,7 @@ mod tests {
                 until: None,
                 year: None,
                 initial_tab: None,
+                ..Default::default()
             },
             Some(UsageData::default()),
         )

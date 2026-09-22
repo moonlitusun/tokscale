@@ -63,7 +63,11 @@ fn background_data_loader(
     year: Option<String>,
     minutely_enabled: bool,
 ) -> DataLoader {
-    DataLoader::with_filters(None, since, until, year).with_minutely_enabled(minutely_enabled)
+    DataLoader::with_filters(None, since, until, year)
+        .with_minutely_enabled(minutely_enabled)
+        // The Projects tab rolls up workspaces regardless of the global
+        // grouping, so both background loads always pay workspace resolution.
+        .with_projects_enabled(true)
 }
 
 fn background_cache_scope(
@@ -84,6 +88,7 @@ pub fn run(
     until: Option<String>,
     year: Option<String>,
     initial_tab: Option<Tab>,
+    worktree_rollup: tokscale_core::WorktreeRollup,
 ) -> Result<()> {
     if debug {
         let _ = tracing_subscriber::fmt()
@@ -100,6 +105,7 @@ pub fn run(
         until: until.clone(),
         year: year.clone(),
         initial_tab,
+        worktree_rollup,
     };
 
     // Build the unified filter set used by the cache key, the App
@@ -240,7 +246,6 @@ pub fn run(
 }
 
 fn restore_terminal_best_effort() {
-    tokscale_core::tui_signal::set_tui_active(false);
     let _ = execute!(
         io::stdout(),
         LeaveAlternateScreen,
@@ -248,10 +253,12 @@ fn restore_terminal_best_effort() {
         SetTitle("")
     );
     let _ = disable_raw_mode();
+    // Flush diagnostics that were deferred while the TUI owned raw mode only
+    // after normal stderr is visible again.
+    tokscale_core::tui_signal::set_tui_active(false);
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
-    tokscale_core::tui_signal::set_tui_active(false);
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
@@ -260,6 +267,9 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
         SetTitle("")
     );
     let _ = terminal.show_cursor();
+    // set_tui_active(false) drains deferred stderr, so it must be the last
+    // restoration step rather than writing into the alternate screen.
+    tokscale_core::tui_signal::set_tui_active(false);
 }
 
 fn run_loop_with_background(
@@ -323,12 +333,19 @@ fn run_loop_with_background(
             let group_by = app.group_by.borrow().clone();
             let report_scope = background_cache_scope(&since, &until, &year);
             let minutely_enabled = app.settings.minutely_tab_enabled;
+            let worktree_rollup = app.worktree_rollup;
 
             thread::spawn(move || {
-                let loader = background_data_loader(since, until, year, minutely_enabled);
+                let loader = background_data_loader(since, until, year, minutely_enabled)
+                    .with_worktree_rollup(worktree_rollup);
                 let result = loader.load(&clients, &group_by, include_synthetic);
                 if let Ok(ref data) = result {
-                    save_cached_data(data, &enabled_clients, &group_by, &report_scope);
+                    // Rolled-up rows are a different aggregation of the same
+                    // messages, so caching them under the plain workspace scope
+                    // would serve merged rows to a later un-merged view.
+                    if worktree_rollup == tokscale_core::WorktreeRollup::Separate {
+                        save_cached_data(data, &enabled_clients, &group_by, &report_scope);
+                    }
                 }
                 let _ = tx.send(result);
             });
@@ -381,6 +398,7 @@ pub fn test_data_loading() -> Result<()> {
         ClientId::Crush,
         ClientId::Hermes,
         ClientId::Codebuff,
+        ClientId::Freebuff,
     ];
 
     let data = loader.load(&all_clients, &tokscale_core::GroupBy::default(), false)?;
@@ -433,6 +451,14 @@ mod tests {
 
         let disabled = background_data_loader(None, None, None, false);
         assert!(!disabled.minutely_enabled);
+    }
+
+    #[test]
+    fn background_loader_enables_projects() {
+        // The Projects tab rolls up workspaces regardless of the global
+        // grouping, so both background loads must resolve workspaces.
+        let loader = background_data_loader(None, None, None, false);
+        assert!(loader.projects_enabled);
     }
 
     #[test]

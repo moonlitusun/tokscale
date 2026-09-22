@@ -8,7 +8,7 @@ use std::path::PathBuf;
 const API_TOKEN_ENV_VAR: &str = "TOKSCALE_API_TOKEN";
 
 fn home_dir() -> Result<PathBuf> {
-    dirs::home_dir().context("Could not determine home directory")
+    crate::paths::home_dir().context("Could not determine home directory")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,7 +236,7 @@ pub async fn login() -> Result<()> {
     println!("\n  {}\n", "Tokscale - Login".cyan());
     println!("{}", "  Requesting authorization code...".bright_black());
 
-    let client = reqwest::Client::builder()
+    let client = tokscale_core::http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
@@ -358,7 +358,7 @@ pub async fn login_with_token(token: &str) -> Result<()> {
     }
 
     let base_url = get_api_base_url();
-    let client = reqwest::Client::builder()
+    let client = tokscale_core::http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 

@@ -29,6 +29,8 @@ import {
 } from "@/components/profile";
 import type { DailyContribution } from "@/lib/types";
 import { useSettings } from "@/lib/useSettings";
+import { resolveEffectiveTimeZone } from "@/lib/timezone";
+import type { ModerationNotice } from "@/lib/moderation/notice";
 
 type ProfilePeriod = "all" | "week" | "month";
 
@@ -65,11 +67,18 @@ export interface ProfileData {
   clients: string[];
   models: string[];
   mcpServers?: string[];
+  /** True once any accepted submission carried a backfill provenance tag. */
+  hasBackfill?: boolean;
   modelUsage?: ModelUsage[];
   contributions: DailyContribution[];
   period?: ProfilePeriod;
 }
 
+// Both branches already end on or after the newest submitted date: the server
+// anchors every window to it, so `chartRange.end` and the period `apiRange.end`
+// it also fills are both that anchor. Nothing here may depend on the viewer's
+// clock — contribution dates are calendar buckets the submitting machine
+// already resolved.
 function getProfileChartRange(
   period: ProfilePeriod,
   apiRange: ProfileData["dateRange"],
@@ -82,14 +91,54 @@ interface ProfilePageClientProps {
   initialData: ProfileData;
   initialDevices?: ProfileDevice[];
   username: string;
+  /**
+   * Populated for every viewer of a hidden account, not just its owner. The
+   * server resolves this outside the cached public payload and picks the
+   * wording by audience, so the component renders whatever it is handed
+   * without deciding who may see it — see lib/moderation/notice.ts.
+   */
+  moderationNotice?: ModerationNotice | null;
 }
 
 const EARLY_ADOPTERS = ["code-yeongyu", "gtg7784", "qodot"];
+
+/**
+ * Amber for the two cases the account holder may want to contest, neutral blue
+ * when the cause is our own data problem — that one is informational, and
+ * dressing it as a warning would imply they did something wrong. The colour
+ * carries the same meaning to a visitor, who is reading the same decision.
+ */
+const ModerationNoticeBanner = styled.div<{ $tone: ModerationNotice["tone"] }>`
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 20px;
+  padding: 16px 18px;
+  border: 1px solid
+    ${({ $tone }) =>
+      $tone === "our-fault" ? "rgba(47, 143, 255, 0.4)" : "rgba(217, 119, 6, 0.45)"};
+  border-radius: 10px;
+  background: ${({ $tone }) =>
+    $tone === "our-fault" ? "rgba(47, 143, 255, 0.09)" : "rgba(217, 119, 6, 0.09)"};
+
+  strong {
+    color: var(--service-text);
+    font-size: 0.9375rem;
+    font-weight: 600;
+  }
+
+  span {
+    color: var(--service-text-muted);
+    font-size: 0.875rem;
+    line-height: 1.6;
+  }
+`;
 
 export default function ProfilePageClient({
   initialData,
   initialDevices,
   username,
+  moderationNotice,
 }: ProfilePageClientProps) {
   const [activeTab, setActiveTab] = useState<ProfileTab>("activity");
   const [contributionView, setContributionView] =
@@ -97,10 +146,18 @@ export default function ProfilePageClient({
   const {
     paletteName: contributionPalette,
     setPalette: setContributionPalette,
+    timezone: timezonePreference,
+    mounted,
   } = useSettings();
   const contributionBreakdownId = useId();
   const data = initialData;
   const period = data.period ?? "all";
+  // Absolute instants ("Updated", "Joined") render in the viewer's display
+  // timezone; calendar-day buckets never do — see resolveEffectiveTimeZone.
+  // UTC before mount so the first client render matches the server markup.
+  const effectiveTimeZone = mounted
+    ? resolveEffectiveTimeZone(timezonePreference)
+    : "UTC";
   const rollingChartRange = useMemo(
     () => getProfileChartRange(period, data.dateRange, data.chartRange),
     [period, data.chartRange, data.dateRange],
@@ -222,6 +279,13 @@ export default function ProfilePageClient({
 
       <MainContent id="main-content">
         <ContentWrapper>
+          {moderationNotice && (
+            <ModerationNoticeBanner role="status" $tone={moderationNotice.tone}>
+              <strong>{moderationNotice.title}</strong>
+              <span>{moderationNotice.message}</span>
+            </ModerationNoticeBanner>
+          )}
+
           {showResubmitBanner && (
             <UpdateNotice role="status">
               <strong>Fresh detail is available.</strong> Re-submit with{" "}
@@ -234,7 +298,17 @@ export default function ProfilePageClient({
             stats={stats}
             lastUpdated={data.updatedAt ?? undefined}
             period={period}
+            timeZone={effectiveTimeZone}
           />
+
+          {data.hasBackfill && (
+            <BackfillBadge
+              role="note"
+              title="Totals include usage imported from a third-party export via `tokscale import`, not only locally-scanned CLI sessions."
+            >
+              includes imported history
+            </BackfillBadge>
+          )}
 
           <ViewControls aria-label="Profile data views">
             <TabsScroller>
@@ -545,6 +619,17 @@ const UpdateNotice = styled.p`
     font-size: 14px;
     line-height: 20px;
   }
+`;
+
+const BackfillBadge = styled.span`
+  align-self: flex-start;
+  padding: 3px 10px;
+  border: 1px solid color-mix(in srgb, var(--service-text) 18%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--service-text) 6%, transparent);
+  color: color-mix(in srgb, var(--service-text) 72%, transparent);
+  font-size: 12px;
+  line-height: 18px;
 `;
 
 const ViewControls = styled.div`

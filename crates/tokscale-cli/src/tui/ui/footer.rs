@@ -2,12 +2,13 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::spinner::{get_phase_message, get_scanner_spans};
-use super::widgets::{format_cost, format_tokens};
+use super::widgets::{format_cost, format_tokens, AMBIENT_STABLE_BORDER_SET};
 use crate::tui::app::{App, ClickAction, SortField, Tab};
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .style(Style::default().bg(app.theme.background));
 
@@ -115,7 +116,7 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
     let total_tokens = app.data.total_tokens;
     right_spans.push(Span::styled(
         format_tokens(total_tokens),
-        Style::default().fg(Color::Cyan),
+        app.theme.count_style(),
     ));
     if !is_very_narrow {
         right_spans.push(Span::styled(
@@ -162,12 +163,16 @@ fn current_count_label(app: &App) -> String {
             format!(" ({} days)", app.get_sorted_monthly_detail_days().len())
         }
         Tab::Monthly => format!(" ({} months)", app.data.monthly.len()),
+        Tab::Sessions => format!(" ({} sessions)", app.data.sessions.len()),
+        Tab::Projects => format!(" ({} projects)", app.data.projects.len()),
         Tab::Stats | Tab::Usage => String::new(),
     }
 }
 
 fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
     let is_very_narrow = app.is_very_narrow();
+    let hint_style = app.theme.hint_key_style();
+    let count_style = app.theme.count_style();
 
     let spans = if is_very_narrow {
         let mut spans = vec![
@@ -177,37 +182,37 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("·", Style::default().fg(app.theme.muted)),
             Span::styled("d/t/c", Style::default().fg(Color::Blue)),
             Span::styled("·", Style::default().fg(app.theme.muted)),
-            Span::styled("[s]", Style::default().fg(Color::Cyan)),
+            Span::styled("[s]", count_style),
             Span::styled("·", Style::default().fg(app.theme.muted)),
-            Span::styled("[g]", Style::default().fg(Color::Cyan)),
+            Span::styled("[g]", count_style),
             Span::styled("·", Style::default().fg(app.theme.muted)),
             Span::styled("[p]", Style::default().fg(Color::Magenta)),
             Span::styled("·", Style::default().fg(app.theme.muted)),
-            Span::styled("[r]", Style::default().fg(Color::Yellow)),
+            Span::styled("[r]", hint_style),
             Span::styled("·", Style::default().fg(app.theme.muted)),
             Span::styled("q", Style::default().fg(app.theme.muted)),
         ];
         if app.current_tab == Tab::Daily {
             spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
             if app.is_daily_detail_active() {
-                spans.push(Span::styled("esc", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("esc", hint_style));
             } else {
-                spans.push(Span::styled("↵", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("↵", hint_style));
                 spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
-                spans.push(Span::styled("j", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("j", hint_style));
             }
         }
         if app.current_tab == Tab::Monthly {
             spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
             if app.is_monthly_detail_active() {
-                spans.push(Span::styled("esc", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("esc", hint_style));
             } else {
-                spans.push(Span::styled("↵", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("↵", hint_style));
             }
         }
         if app.current_tab == Tab::Hourly {
             spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
-            spans.push(Span::styled("v", Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled("v", hint_style));
         }
         spans
     } else {
@@ -221,53 +226,43 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
         ];
         if app.current_tab == Tab::Daily {
             if app.is_daily_detail_active() {
-                spans.push(Span::styled(
-                    "[esc:back]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled("[esc:back]", hint_style));
             } else {
-                spans.push(Span::styled(
-                    "[enter:details]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled("[enter:details]", hint_style));
                 spans.push(Span::styled(" ", Style::default()));
-                spans.push(Span::styled(
-                    "[j:today]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled("[j:today]", hint_style));
             }
             spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
         }
         if app.current_tab == Tab::Monthly {
             if app.is_monthly_detail_active() {
-                spans.push(Span::styled(
-                    "[esc:back]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled("[esc:back]", hint_style));
             } else {
-                spans.push(Span::styled(
-                    "[enter:details]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled("[enter:details]", hint_style));
             }
             spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
         }
         if app.current_tab == Tab::Hourly {
-            spans.push(Span::styled(
-                "[v:profile]",
-                Style::default().fg(Color::Yellow),
-            ));
+            spans.push(Span::styled("[v:profile]", hint_style));
             spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
         }
-        spans.push(Span::styled(
-            "[s:sources]",
-            Style::default().fg(Color::Cyan),
-        ));
+        spans.push(Span::styled("[s:sources]", count_style));
         spans.push(Span::styled(" ", Style::default()));
         spans.push(Span::styled(
             format!("[g:{}]", app.group_by.borrow()),
-            Style::default().fg(Color::Cyan),
+            count_style,
         ));
+        // `w` only does anything under workspace grouping, so only advertise it there.
+        if *app.group_by.borrow() == tokscale_core::GroupBy::WorkspaceModel {
+            spans.push(Span::styled(" ", Style::default()));
+            spans.push(Span::styled(
+                match app.worktree_rollup {
+                    tokscale_core::WorktreeRollup::MergeIntoRepo => "[w:repos]",
+                    tokscale_core::WorktreeRollup::Separate => "[w:worktrees]",
+                },
+                count_style,
+            ));
+        }
         spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
         spans.push(Span::styled(
             format!("[p:{}]", app.theme.name.as_str()),
@@ -287,10 +282,7 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             }),
         ));
         spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
-        spans.push(Span::styled(
-            "[r:refresh]",
-            Style::default().fg(Color::Yellow),
-        ));
+        spans.push(Span::styled("[r:refresh]", hint_style));
         spans.push(Span::styled(
             " • e • q",
             Style::default().fg(app.theme.muted),
@@ -416,6 +408,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: Some(tab),
+            ..Default::default()
         };
         App::new_with_cached_data(config, Some(UsageData::default())).unwrap()
     }
@@ -435,6 +428,10 @@ mod tests {
         assert_eq!(
             current_count_label(&make_app_on(Tab::Monthly)),
             " (0 months)"
+        );
+        assert_eq!(
+            current_count_label(&make_app_on(Tab::Sessions)),
+            " (0 sessions)"
         );
         assert_eq!(current_count_label(&make_app_on(Tab::Stats)), "");
     }

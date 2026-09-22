@@ -1,6 +1,11 @@
 "use client";
 
-export { ProfileOverview, formatLastUpdated } from "./ProfileOverview";
+export {
+  ProfileOverview,
+  formatJoined,
+  formatLastUpdated,
+  getProfileRankLabel,
+} from "./ProfileOverview";
 export type { ProfileOverviewProps } from "./ProfileOverview";
 
 export { ProfileTabBar } from "./ProfileTabBar";

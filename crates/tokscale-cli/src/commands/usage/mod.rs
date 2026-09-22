@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(dead_code))]
 
 mod amp;
+mod antigravity;
 mod claude;
 pub mod codex;
 mod copilot;
@@ -9,7 +10,10 @@ pub mod helpers;
 mod kimi;
 mod minimax;
 mod minimax_tokenplan;
+mod opencode_go;
 mod sakana;
+#[cfg(test)]
+mod test_server;
 mod warp;
 mod zai;
 
@@ -74,6 +78,8 @@ pub struct UsageOutput {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<UsageAccount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
     pub plan: Option<String>,
     pub email: Option<String>,
     pub metrics: Vec<UsageMetric>,
@@ -209,7 +215,6 @@ pub struct UsageFetchReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageFetchIntent {
-    #[allow(dead_code)]
     CliReadOnly,
     TuiSurface,
 }
@@ -277,16 +282,29 @@ impl UsageOutput {
 
 // ── Cache ──
 
-fn cache_path() -> Option<std::path::PathBuf> {
-    let dir = crate::paths::get_cache_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
+const SUBSCRIPTION_CACHE_FILE: &str = "subscription-usage-cache.json";
+
+fn cache_path_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if std::fs::create_dir_all(dir).is_err() {
         return None;
     }
-    Some(dir.join("subscription-usage-cache.json"))
+    Some(dir.join(SUBSCRIPTION_CACHE_FILE))
 }
 
-pub fn save_cache(data: &[UsageOutput]) {
-    let Some(path) = cache_path() else { return };
+#[cfg(not(test))]
+fn cache_path() -> Option<std::path::PathBuf> {
+    cache_path_in(&crate::paths::get_cache_dir())
+}
+
+// Unit-test callers must use the explicit-path helpers below. Making the
+// production resolver unavailable prevents an unrelated parallel test from
+// reading, writing, or deleting the developer's real subscription cache.
+#[cfg(test)]
+fn cache_path() -> Option<std::path::PathBuf> {
+    None
+}
+
+fn save_cache_at(path: &std::path::Path, data: &[UsageOutput]) {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -295,19 +313,27 @@ pub fn save_cache(data: &[UsageOutput]) {
         "timestamp": timestamp,
         "data": data,
     });
-    let _ = std::fs::write(&path, serde_json::to_string(&json).unwrap_or_default());
+    let _ = std::fs::write(path, serde_json::to_string(&json).unwrap_or_default());
+}
+
+pub fn save_cache(data: &[UsageOutput]) {
+    if let Some(path) = cache_path() {
+        save_cache_at(&path, data);
+    }
+}
+
+fn clear_cache_at(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 pub fn clear_cache() {
     if let Some(path) = cache_path() {
-        let _ = std::fs::remove_file(&path);
+        clear_cache_at(&path);
     }
 }
 
-#[cfg_attr(test, allow(dead_code))]
-pub fn load_cache() -> Option<Vec<UsageOutput>> {
-    let path = cache_path()?;
-    let content = std::fs::read_to_string(&path).ok()?;
+fn load_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
+    let content = std::fs::read_to_string(path).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
     let timestamp = doc.get("timestamp")?.as_u64()?;
     let age = std::time::SystemTime::now()
@@ -320,6 +346,12 @@ pub fn load_cache() -> Option<Vec<UsageOutput>> {
         return None;
     }
     serde_json::from_value(doc.get("data")?.clone()).ok()
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub fn load_cache() -> Option<Vec<UsageOutput>> {
+    load_cache_at(&cache_path()?)
+        .map(|outputs| filter_disabled_outputs(outputs, &disabled_provider_ids()))
 }
 
 // ── Public API ──
@@ -339,104 +371,114 @@ impl Fetch {
     }
 }
 
-type UsageProvider = (&'static str, fn() -> bool, Fetch);
-
-/// A provider that is active (has credentials) but whose fetch failed.
-///
-/// `name` is the human-facing provider label and `error` is the formatted
-/// error message (e.g. sakana's "refresh SAKANA_SESSION_COOKIE" guidance).
-#[derive(Debug, Clone)]
-pub struct ProviderError {
-    pub name: &'static str,
-    pub error: String,
-}
-
-/// Backwards-compatible entry point: returns only successful provider outputs.
-///
-/// Per-provider errors are silently discarded here. Callers that need to make
-/// failures visible (e.g. the CLI `run`) should use [`fetch_all_with_errors`].
-///
-/// Used by the TUI dashboard (non-test builds only); the TUI test build stubs
-/// the fetch out, so allow it to be unused there.
-#[allow(dead_code)]
-pub fn fetch_all() -> Vec<UsageOutput> {
-    fetch_all_with_errors().0
-}
-
-/// Fetch usage for every active provider in parallel, returning both the
-/// successful outputs and the per-provider errors.
-///
-/// Previously a provider whose `fetch` returned `Err` (notably a stale/expired
-/// session-cookie auth error) was silently dropped: `has_credentials()` reports
-/// the provider as active, yet it just vanished from the output. This collects
-/// those errors so the caller can surface them to the user instead.
-pub fn fetch_all_with_errors() -> (Vec<UsageOutput>, Vec<ProviderError>) {
-    let active: Vec<_> = usage_providers(Fetch::Multi(codex::fetch_all))
-        .into_iter()
-        .filter(|(_, has, _)| has())
-        .collect();
-
-    if active.is_empty() {
-        return (vec![], vec![]);
-    }
-
-    let results = std::thread::scope(|s| {
-        let handles: Vec<_> = active
-            .into_iter()
-            .map(|(name, _, fetch)| s.spawn(move || (name, fetch.call())))
-            .collect();
-
-        handles
-            .into_iter()
-            .filter_map(|handle| {
-                // A panicked provider thread should not take down the whole
-                // command; skip it (a join error has no message to surface).
-                handle.join().ok()
-            })
-            .collect::<Vec<_>>()
-    });
-
-    partition_results(results)
-}
+type UsageProvider = (&'static str, &'static str, fn() -> bool, Fetch);
 
 fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
     vec![
         (
+            "claude",
             "Claude",
             claude::has_credentials,
             Fetch::Single(claude::fetch),
         ),
-        ("Codex", codex::has_credentials, codex_fetch),
-        ("Z.ai", zai::has_credentials, Fetch::Single(zai::fetch)),
-        ("Amp", amp::has_credentials, Fetch::Single(amp::fetch)),
+        ("codex", "Codex", codex::has_credentials, codex_fetch),
         (
+            "zai",
+            "Z.ai",
+            zai::has_credentials,
+            Fetch::Single(zai::fetch),
+        ),
+        (
+            "amp",
+            "Amp",
+            amp::has_credentials,
+            Fetch::Single(amp::fetch),
+        ),
+        (
+            "antigravity",
+            "Antigravity",
+            antigravity::has_credentials,
+            // One output per model group: Antigravity meters Gemini models and
+            // Claude/GPT models against separate limits.
+            Fetch::Multi(antigravity::fetch_all),
+        ),
+        (
+            "copilot",
             "Copilot",
             copilot::has_credentials,
             Fetch::Single(copilot::fetch),
         ),
         (
+            "grok",
             "Grok Build",
             grok::has_credentials,
             Fetch::Single(grok::fetch),
         ),
-        ("Kimi", kimi::has_credentials, Fetch::Single(kimi::fetch)),
         (
+            "kimi",
+            "Kimi",
+            kimi::has_credentials,
+            Fetch::Single(kimi::fetch),
+        ),
+        (
+            "minimax",
             "MiniMax",
             minimax::has_credentials,
             Fetch::Single(minimax::fetch),
         ),
         (
+            "minimax-token-plan",
             "MiniMax Token Plan",
             minimax_tokenplan::has_credentials,
             Fetch::Multi(minimax_tokenplan::fetch_all),
         ),
-        ("Warp/Oz", warp::has_credentials, Fetch::Single(warp::fetch)),
         (
+            "warp",
+            "Warp/Oz",
+            warp::has_credentials,
+            Fetch::Single(warp::fetch),
+        ),
+        (
+            "sakana",
             "Sakana",
             sakana::has_credentials,
             Fetch::Single(sakana::fetch),
         ),
+        (
+            "opencode-go",
+            "OpenCode Go",
+            opencode_go::has_credentials,
+            Fetch::Multi(opencode_go::fetch_all),
+        ),
     ]
+}
+
+fn disabled_provider_ids() -> std::collections::HashSet<String> {
+    crate::tui::settings::Settings::load()
+        .usage
+        .disabled_providers
+        .into_iter()
+        .map(|id| id.trim().to_ascii_lowercase())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+fn filter_disabled_outputs(
+    outputs: impl IntoIterator<Item = UsageOutput>,
+    disabled: &std::collections::HashSet<String>,
+) -> Vec<UsageOutput> {
+    outputs
+        .into_iter()
+        .filter(|output| {
+            provider_id_for_label(&output.provider).is_none_or(|id| !disabled.contains(id))
+        })
+        .collect()
+}
+
+fn provider_id_for_label(label: &str) -> Option<&'static str> {
+    usage_providers(Fetch::Multi(codex::fetch_all))
+        .into_iter()
+        .find_map(|(id, provider, _, _)| (provider == label).then_some(id))
 }
 
 fn fetch_provider_report(
@@ -458,10 +500,43 @@ pub fn fetch_all_report_with_intent(intent: UsageFetchIntent) -> UsageFetchRepor
 }
 
 fn fetch_all_report_with_codex(codex_fetch: fn() -> UsageFetchReport) -> UsageFetchReport {
-    let active: Vec<_> = usage_providers(Fetch::Multi(codex::fetch_all))
-        .into_iter()
-        .filter(|(_, has, _)| has())
-        .collect();
+    let disabled = disabled_provider_ids();
+    fetch_all_report_from_providers(
+        usage_providers(Fetch::Multi(codex::fetch_all)),
+        &disabled,
+        codex_fetch,
+    )
+}
+
+fn fetch_all_report_from_providers(
+    providers: Vec<UsageProvider>,
+    disabled: &std::collections::HashSet<String>,
+    codex_fetch: fn() -> UsageFetchReport,
+) -> UsageFetchReport {
+    let mut active: Vec<UsageProvider> = Vec::new();
+    // Observability (#947): when a provider is filtered out for lack of
+    // credentials, log what was probed so a missing quota card can be traced
+    // to credential detection rather than the fetch path.
+    for (id, provider, has, fetch) in providers {
+        // This check is deliberately before `has()`: probing some providers
+        // imports auth state, which users explicitly opted out of touching.
+        if disabled.contains(id) {
+            continue;
+        }
+        if has() {
+            active.push((id, provider, has, fetch));
+        } else {
+            tracing::debug!(
+                provider,
+                probes = ?if provider == "Copilot" {
+                    copilot::credential_probe()
+                } else {
+                    Vec::<String>::new()
+                },
+                "usage provider filtered out: no credentials detected"
+            );
+        }
+    }
 
     if active.is_empty() {
         return UsageFetchReport::default();
@@ -470,7 +545,7 @@ fn fetch_all_report_with_codex(codex_fetch: fn() -> UsageFetchReport) -> UsageFe
     std::thread::scope(|scope| {
         let handles = active
             .into_iter()
-            .map(|(provider, _, fetch)| {
+            .map(|(_, provider, _, fetch)| {
                 let handle = if provider == "Codex" {
                     scope.spawn(codex_fetch)
                 } else {
@@ -493,29 +568,12 @@ fn fetch_all_report_with_codex(codex_fetch: fn() -> UsageFetchReport) -> UsageFe
                 )),
             }
         }
+        report.outputs = filter_disabled_outputs(report.outputs, disabled);
+        report.diagnostics.retain(|diagnostic| {
+            provider_id_for_label(&diagnostic.provider).is_none_or(|id| !disabled.contains(id))
+        });
         report
     })
-}
-
-/// Split per-provider fetch results into (successful outputs, errors).
-///
-/// An active provider returning `Err` becomes a [`ProviderError`] rather than
-/// being silently dropped.
-fn partition_results(
-    results: Vec<(&'static str, Result<Vec<UsageOutput>>)>,
-) -> (Vec<UsageOutput>, Vec<ProviderError>) {
-    let mut outputs = Vec::new();
-    let mut errors = Vec::new();
-    for (name, result) in results {
-        match result {
-            Ok(mut provider_outputs) => outputs.append(&mut provider_outputs),
-            Err(err) => errors.push(ProviderError {
-                name,
-                error: err.to_string(),
-            }),
-        }
-    }
-    (outputs, errors)
 }
 
 // ── Light-mode rendering ──
@@ -594,21 +652,33 @@ fn render_light(output: &UsageOutput) {
     println!("╰{}╯", "─".repeat(CARD_WIDTH));
 }
 
-pub fn run(json: bool, _light: bool) -> Result<()> {
-    let (outputs, errors) = fetch_all_with_errors();
+pub fn run(json: bool, _light: bool, debug: bool) -> Result<()> {
+    if debug {
+        // Log to stderr so `--json` stdout stays pure JSON for downstream
+        // consumers (see the note in the json branch below).
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+    let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
     if json {
         // Keep stdout pure JSON: do NOT emit provider warnings here, since they
         // would corrupt downstream `--json` consumers that read stderr too.
-        println!("{}", serde_json::to_string_pretty(&outputs)?);
+        println!("{}", serde_json::to_string_pretty(&report.outputs)?);
     } else {
-        for o in &outputs {
+        for o in &report.outputs {
             render_light(o);
         }
         // Surface active-but-failed providers (e.g. an expired session cookie)
         // so they don't silently vanish from the output. One concise line per
         // failing provider, on stderr to keep stdout clean.
-        for err in &errors {
-            eprintln!("{}: {} — skipped", err.name, err.error);
+        for diagnostic in &report.diagnostics {
+            eprintln!(
+                "{}: {} — skipped",
+                diagnostic.display_name(),
+                diagnostic.message
+            );
         }
     }
     Ok(())
@@ -617,6 +687,131 @@ pub fn run(json: bool, _light: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
+
+    static COUNTERS: OnceLock<Mutex<(usize, usize)>> = OnceLock::new();
+
+    fn counters() -> &'static Mutex<(usize, usize)> {
+        COUNTERS.get_or_init(|| Mutex::new((0, 0)))
+    }
+
+    fn counted_has_credentials() -> bool {
+        counters().lock().unwrap().0 += 1;
+        true
+    }
+
+    fn counted_fetch() -> Result<UsageOutput> {
+        counters().lock().unwrap().1 += 1;
+        Ok(sample_output("Copilot"))
+    }
+
+    fn empty_codex_fetch() -> UsageFetchReport {
+        UsageFetchReport::default()
+    }
+
+    fn copilot_report_fetch() -> UsageFetchReport {
+        UsageFetchReport {
+            outputs: vec![sample_output("Copilot")],
+            diagnostics: vec![UsageFetchDiagnostic::new(
+                "Copilot",
+                None,
+                "stale diagnostic",
+            )],
+        }
+    }
+
+    #[test]
+    fn subscription_cache_public_helpers_are_noop_in_tests() {
+        assert!(cache_path().is_none());
+        save_cache(&[sample_output("Codex")]);
+        assert!(load_cache().is_none());
+        clear_cache();
+    }
+
+    #[test]
+    fn subscription_cache_helpers_use_explicit_path() {
+        let temp = TempDir::new().unwrap();
+        let expected = cache_path_in(&temp.path().join("cache")).unwrap();
+        let data = vec![sample_output("Codex")];
+
+        assert_eq!(
+            expected,
+            temp.path().join("cache/subscription-usage-cache.json")
+        );
+        save_cache_at(&expected, &data);
+        assert_eq!(load_cache_at(&expected).unwrap().len(), 1);
+        assert!(expected.exists());
+        clear_cache_at(&expected);
+        assert!(!expected.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn disabled_provider_skips_credential_probe_and_fetch() {
+        *counters().lock().unwrap() = (0, 0);
+        let disabled = std::collections::HashSet::from(["copilot".to_string()]);
+
+        let report = fetch_all_report_from_providers(
+            vec![(
+                "copilot",
+                "Copilot",
+                counted_has_credentials,
+                Fetch::Single(counted_fetch),
+            )],
+            &disabled,
+            empty_codex_fetch,
+        );
+
+        assert!(report.outputs.is_empty());
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(*counters().lock().unwrap(), (0, 0));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn enabled_provider_still_probes_and_fetches() {
+        *counters().lock().unwrap() = (0, 0);
+
+        let report = fetch_all_report_from_providers(
+            vec![(
+                "copilot",
+                "Copilot",
+                counted_has_credentials,
+                Fetch::Single(counted_fetch),
+            )],
+            &std::collections::HashSet::new(),
+            empty_codex_fetch,
+        );
+
+        assert_eq!(report.outputs.len(), 1);
+        assert_eq!(*counters().lock().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn disabled_providers_filter_cached_cards() {
+        let disabled = std::collections::HashSet::from(["copilot".to_string()]);
+        let outputs = filter_disabled_outputs(
+            vec![sample_output("Copilot"), sample_output("Codex")],
+            &disabled,
+        );
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].provider, "Codex");
+    }
+
+    #[test]
+    fn disabled_providers_filter_fetch_diagnostics() {
+        let disabled = std::collections::HashSet::from(["copilot".to_string()]);
+        let report = fetch_all_report_from_providers(
+            vec![("codex", "Codex", || true, Fetch::Multi(|| Ok(Vec::new())))],
+            &disabled,
+            copilot_report_fetch,
+        );
+
+        assert!(report.outputs.is_empty());
+        assert!(report.diagnostics.is_empty());
+    }
 
     #[test]
     fn usage_output_display_name_includes_account_label() {
@@ -627,6 +822,7 @@ mod tests {
                 label: Some("work".to_string()),
                 is_active: true,
             }),
+            credential_source: None,
             plan: None,
             email: None,
             metrics: Vec::new(),
@@ -647,6 +843,7 @@ mod tests {
                 label: Some("  ".to_string()),
                 is_active: false,
             }),
+            credential_source: None,
             plan: None,
             email: Some("user@example.com".to_string()),
             metrics: Vec::new(),
@@ -667,6 +864,7 @@ mod tests {
                 label: None,
                 is_active: false,
             }),
+            credential_source: None,
             plan: None,
             email: None,
             metrics: Vec::new(),
@@ -676,65 +874,6 @@ mod tests {
         };
 
         assert_eq!(output.display_name(), "Codex (Account 123e45...4000)");
-    }
-
-    fn sample_output(provider: &str) -> UsageOutput {
-        UsageOutput {
-            provider: provider.to_string(),
-            account: None,
-            plan: None,
-            email: None,
-            metrics: Vec::new(),
-            reset_credits: None,
-            credit_status: None,
-            spend_control: None,
-        }
-    }
-
-    #[test]
-    fn partition_results_surfaces_provider_errors_instead_of_dropping_them() {
-        let results: Vec<(&'static str, Result<Vec<UsageOutput>>)> = vec![
-            ("Claude", Ok(vec![sample_output("Claude")])),
-            (
-                "Sakana",
-                Err(anyhow::anyhow!(
-                    "Sakana session expired or invalid. Refresh SAKANA_SESSION_COOKIE."
-                )),
-            ),
-            (
-                "Codex",
-                Ok(vec![sample_output("Codex"), sample_output("Codex")]),
-            ),
-        ];
-
-        let (outputs, errors) = partition_results(results);
-
-        // Successful providers are preserved (including a Multi provider's
-        // several outputs), in order.
-        assert_eq!(outputs.len(), 3);
-        assert_eq!(outputs[0].provider, "Claude");
-        assert_eq!(outputs[1].provider, "Codex");
-        assert_eq!(outputs[2].provider, "Codex");
-
-        // The failing provider's error is surfaced, not silently discarded.
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].name, "Sakana");
-        assert!(
-            errors[0].error.contains("SAKANA_SESSION_COOKIE"),
-            "expected the auth-refresh guidance to be preserved, got: {}",
-            errors[0].error
-        );
-    }
-
-    #[test]
-    fn partition_results_reports_no_errors_when_all_succeed() {
-        let results: Vec<(&'static str, Result<Vec<UsageOutput>>)> =
-            vec![("Claude", Ok(vec![sample_output("Claude")]))];
-
-        let (outputs, errors) = partition_results(results);
-
-        assert_eq!(outputs.len(), 1);
-        assert!(errors.is_empty());
     }
 
     #[test]
@@ -749,7 +888,98 @@ mod tests {
         )?;
 
         assert!(output.account.is_none());
+        assert!(output.credential_source.is_none());
         assert_eq!(output.display_name(), "Codex");
         Ok(())
+    }
+
+    #[test]
+    fn usage_output_round_trips_opencode_credential_source() -> Result<()> {
+        let output: UsageOutput = serde_json::from_str(
+            r#"{
+                "provider": "Codex",
+                "credential_source": "opencode",
+                "plan": "Plus",
+                "email": null,
+                "metrics": []
+            }"#,
+        )?;
+
+        assert_eq!(output.credential_source.as_deref(), Some("opencode"));
+        assert_eq!(
+            serde_json::to_value(output)?
+                .get("credential_source")
+                .and_then(serde_json::Value::as_str),
+            Some("opencode")
+        );
+        Ok(())
+    }
+
+    fn sample_output(provider: &str) -> UsageOutput {
+        UsageOutput {
+            provider: provider.to_string(),
+            account: None,
+            credential_source: None,
+            plan: None,
+            email: None,
+            metrics: Vec::new(),
+            reset_credits: None,
+            credit_status: None,
+            spend_control: None,
+        }
+    }
+
+    /// A provider that has credentials but whose fetch fails must stay visible.
+    ///
+    /// `has_credentials()` reports such a provider as active, so dropping its
+    /// error would make the provider silently vanish from the output instead of
+    /// telling the user their session needs refreshing.
+    #[test]
+    fn fetch_provider_report_surfaces_provider_errors_instead_of_dropping_them() {
+        let report = fetch_provider_report(
+            "Sakana",
+            Err(anyhow::anyhow!(
+                "Sakana session expired or invalid. Refresh SAKANA_SESSION_COOKIE."
+            )),
+        );
+
+        assert!(
+            report.outputs.is_empty(),
+            "a failed fetch must not produce usage outputs, got: {:?}",
+            report.outputs
+        );
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected exactly one diagnostic for the failing provider, got: {:?}",
+            report.diagnostics
+        );
+
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.provider, "Sakana");
+        assert_eq!(diagnostic.kind, UsageFetchDiagnosticKind::FetchFailed);
+        assert_eq!(diagnostic.severity, UsageFetchDiagnosticSeverity::Error);
+        assert!(
+            diagnostic.message.contains("SAKANA_SESSION_COOKIE"),
+            "expected the auth-refresh guidance to be preserved, got: {}",
+            diagnostic.message
+        );
+        assert_eq!(diagnostic.display_name(), "Sakana");
+    }
+
+    #[test]
+    fn fetch_provider_report_reports_no_diagnostics_when_fetch_succeeds() {
+        let report = fetch_provider_report(
+            "Codex",
+            Ok(vec![sample_output("Codex"), sample_output("Codex")]),
+        );
+
+        assert_eq!(report.outputs.len(), 2);
+        assert!(report.outputs.iter().all(|o| o.provider == "Codex"));
+        assert!(
+            report.diagnostics.is_empty(),
+            "a successful fetch must not emit diagnostics, got: {:?}",
+            report.diagnostics
+        );
     }
 }
