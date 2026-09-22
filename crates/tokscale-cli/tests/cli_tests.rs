@@ -252,7 +252,7 @@ fn headless_capture_command(
     mode: &str,
     timeout_ms: u64,
 ) -> Command {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     let path = std::env::var_os("PATH").unwrap_or_default();
     let joined_path = std::env::join_paths(
         std::iter::once(fake_bin.to_path_buf()).chain(std::env::split_paths(&path)),
@@ -285,7 +285,7 @@ fn headless_capture_mcode_injects_stream_json_after_exec() {
     )
     .unwrap();
 
-    cargo_bin_cmd!("tokscale")
+    cargo_bin_cmd!("tu")
         .env("HOME", fake_bin.path())
         .env("TOKSCALE_FAKE_CODEX_MODE", "args")
         .env("PATH", joined_path)
@@ -1018,7 +1018,7 @@ fn sandbox_config_dir(tmp: &Path) -> std::path::PathBuf {
 }
 
 fn cmd_with_home(tmp: &Path) -> Command {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.env("HOME", tmp)
         .env("XDG_CONFIG_HOME", tmp.join(".config"))
         .env("XDG_DATA_HOME", tmp.join(".local/share"))
@@ -1066,7 +1066,7 @@ fn cmd_with_home(tmp: &Path) -> Command {
 }
 
 fn cmd_with_conflicting_env(tmp: &Path) -> Command {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.env("HOME", tmp)
         .env("XDG_CONFIG_HOME", tmp.join(".config"))
         .env("XDG_DATA_HOME", tmp.join(".local/share"))
@@ -1076,7 +1076,7 @@ fn cmd_with_conflicting_env(tmp: &Path) -> Command {
 }
 
 fn offline_cmd_with_home(tmp: &Path) -> Command {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     // Pin every XDG_* var so the cache resolvers stay inside the sandbox.
     // Without XDG_CONFIG_HOME the post-#470 cache root can leak to the
     // host's $XDG_CONFIG_HOME (set globally on some CI runners) and
@@ -1649,7 +1649,7 @@ fn write_cursor_credentials(base: &Path) {
 
 #[test]
 fn test_help_command() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("--help")
         .assert()
         .success()
@@ -1658,7 +1658,7 @@ fn test_help_command() {
 
 #[test]
 fn test_help_short_flag() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("-h")
         .assert()
         .success()
@@ -1667,7 +1667,7 @@ fn test_help_short_flag() {
 
 #[test]
 fn test_version_flag() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("--version")
         .assert()
         .success()
@@ -1679,7 +1679,7 @@ fn test_version_flag() {
 
 #[test]
 fn test_models_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("models")
         .arg("--help")
         .assert()
@@ -1689,7 +1689,7 @@ fn test_models_command_help() {
 
 #[test]
 fn test_monthly_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("monthly")
         .arg("--help")
         .assert()
@@ -1699,7 +1699,7 @@ fn test_monthly_command_help() {
 
 #[test]
 fn test_pricing_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("pricing")
         .arg("--help")
         .assert()
@@ -1709,7 +1709,7 @@ fn test_pricing_command_help() {
 
 #[test]
 fn test_clients_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("clients")
         .arg("--help")
         .assert()
@@ -1719,7 +1719,7 @@ fn test_clients_command_help() {
 
 #[test]
 fn test_codex_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("codex")
         .arg("--help")
         .assert()
@@ -1731,7 +1731,7 @@ fn test_codex_command_help() {
 
 #[test]
 fn test_codex_activity_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.args(["codex", "activity", "--help"])
         .assert()
         .success()
@@ -1742,7 +1742,7 @@ fn test_codex_activity_command_help() {
 
 #[test]
 fn test_graph_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("graph")
         .arg("--help")
         .assert()
@@ -1811,7 +1811,7 @@ fn test_import_does_not_leak_local_mcp_servers() {
 
 #[test]
 fn test_tui_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("tui")
         .arg("--help")
         .assert()
@@ -1821,7 +1821,7 @@ fn test_tui_command_help() {
 
 #[test]
 fn test_headless_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("headless")
         .arg("--help")
         .assert()
@@ -1831,7 +1831,7 @@ fn test_headless_command_help() {
 
 #[test]
 fn test_login_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("login")
         .arg("--help")
         .assert()
@@ -1841,7 +1841,7 @@ fn test_login_command_help() {
 
 #[test]
 fn test_logout_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("logout")
         .arg("--help")
         .assert()
@@ -1851,7 +1851,7 @@ fn test_logout_command_help() {
 
 #[test]
 fn test_whoami_command_help() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("whoami")
         .arg("--help")
         .assert()
@@ -1861,13 +1861,13 @@ fn test_whoami_command_help() {
 
 #[test]
 fn test_invalid_command() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("invalid-command").assert().failure();
 }
 
 #[test]
 fn test_invalid_subcommand() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("models").arg("invalid-flag").assert().failure();
 }
 
@@ -1932,7 +1932,7 @@ fn test_models_with_invalid_year() {
 
 #[test]
 fn test_global_theme_flag() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("--theme")
         .arg("blue")
         .arg("--help")
@@ -1942,7 +1942,7 @@ fn test_global_theme_flag() {
 
 #[test]
 fn test_global_debug_flag() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let mut cmd = cargo_bin_cmd!("tu");
     cmd.arg("--debug").arg("--help").assert().success();
 }
 
@@ -2112,7 +2112,7 @@ fn test_models_home_override_ignores_conflicting_codex_home_env() {
 fn test_tui_rejects_home_override() {
     let tmp = TempDir::new().unwrap();
 
-    cargo_bin_cmd!("tokscale")
+    cargo_bin_cmd!("tu")
         .args(["--home", tmp.path().to_str().unwrap(), "tui"])
         .assert()
         .failure()
