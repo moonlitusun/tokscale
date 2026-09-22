@@ -1,6 +1,6 @@
 {
   "name": "tokenusage",
-  "version": "4.5.3",
+  "version": "4.5.4",
   "description": "Alias for @tokenusage/cli — A high-performance CLI tool and visualization dashboard for tracking AI coding assistant token usage and costs across multiple platforms.",
   "type": "module",
   "main": "index.js",
@@ -29,7 +29,7 @@
     "cli"
   ],
   "dependencies": {
-    "tokenusage-cli": "4.5.3"
+    "tokenusage-cli": "4.5.4"
   },
   "publishConfig": {
     "registry": "http://npm.dzfe.net/",

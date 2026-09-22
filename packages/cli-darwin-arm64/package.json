@@ -1,6 +1,6 @@
 {
   "name": "tokenusage-cli-darwin-arm64",
-  "version": "4.5.3",
+  "version": "4.5.4",
   "description": "tokenusage CLI binary for darwin arm64",
   "license": "MIT",
   "type": "module",
